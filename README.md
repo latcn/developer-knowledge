@@ -1,2 +1,10 @@
-# developer_knowledge
-developer knowledge
+# developer-knowledge
+
+* [Redis](./redis/Redis专家级技术文档：从第一性原理到生产实践.md)  
+* 
+  
+
+
+请优化提示词：你是*rocketmq* 专家，请以费曼学习法/第一性原理分析 *rocketmq*的架构设计、核心原理算法、主要功能等，形成一份可学习的专家级技术文档，可通过这个文档可以掌握*rocketmq*的大部分知识，可以达到专家级水平
+
+
