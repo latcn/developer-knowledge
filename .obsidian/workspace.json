@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "elasticsearch/深入理解Elasticsearch：从第一性原理到专家实践.md",
+                "file": "README.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "深入理解Elasticsearch：从第一性原理到专家实践"
+              "title": "README"
             }
           }
         ]
@@ -186,11 +186,20 @@
   },
   "active": "559b6b5da9bb74c4",
   "lastOpenFiles": [
+    "rocketmq/RocketMQ专家级深度解析：从第一性原理到生产实战.md",
+    "jvm/jvm总结.md",
+    "jvm/新建 RTF 文件.rtf",
+    "jvm",
+    "新建文件夹",
+    "rocketmq/RocketMq总结.md",
     "README.md",
+    "().md",
     "elasticsearch/深入理解Elasticsearch：从第一性原理到专家实践.md",
+    "rocketmq/rocketmq.md",
+    "rocketmq/新建 RTF 文件.rtf",
+    "rocketmq",
     "elasticsearch/新建 RTF 文件.rtf",
     "elasticsearch",
-    "新建文件夹",
     "redis/Redis专家级技术文档：从第一性原理到生产实践.md",
     "RocketMQ/RocketMQ 专家之路：从第一性原理到架构师级实践.md",
     "redis/Redis 专家级技术文档 ：从第一性原理到生产实践.md",
@@ -212,15 +221,7 @@
     "redis/Redis问题分类.md",
     "redis/Redis费曼问题.md",
     "redis/Redis 专家级技术完整指南.md",
-    "ai prompt.md",
-    "AI Agent产品设计.md",
     "redis",
-    "C And C++学习指南.md",
-    "未命名.canvas",
-    "AI Agent设计/大模型通用调用平台技术方案.md",
-    "AI Agent.md",
-    "AI Agent设计",
-    "1.1.txt",
-    "Clippings"
+    "未命名.canvas"
   ]
 }
