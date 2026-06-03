@@ -4,6 +4,7 @@
 * [ElasticSearch](./elasticsearch/深入理解Elasticsearch：从第一性原理到专家实践.md)
 * [RocketMQ](./rocketmq/RocketMQ专家级深度解析：从第一性原理到生产实战.md)
 * [Seata](./seata/Seata深度解析：从本质矛盾到专家实战.md)
+* [Sentinel](./sentinel/Sentinel专家技术手册：从第一性原理到生产实践.md)
   
 
 
