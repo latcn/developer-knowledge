@@ -1,10 +1,27 @@
-
-> **基于**：《Agent-to-Agent (A2A) 权限设计方案》及多轮迭代讨论  
-> **技术栈**：Spring AI Alibaba A2A + Nacos + Spring Authorization Server + Spring Security 6.3+  
+ 
+> **基于**：《A2A 权限系统架构设计文档》《A2A 数据模型设计文档》及多轮讨论整合  
+> **技术栈**：Spring AI Alibaba A2A 1.1.2.2 + Nacos + Spring Authorization Server 1.5.7 + Spring Security 6.3+  
 > **核心**：OAuth2 Token Exchange (RFC 8693) + 一次性令牌 + 模块化权限服务  
 > **包名**：`io.github.latcn.a2a.security`  
-> **模块**：`a2a-security` 父模块，包含 `a2a-authorization-server`、`a2a-common-permission`、`a2a-security-starter`
-> **版本兼容性**：Spring Boot 3.2.x、Spring Cloud Alibaba 2023.0.x、Spring Authorization Server 1.5.7、Spring AI Alibaba 1.0.0.4、Nacos 3.2.1。
+> **模块**：`a2a-security` 父模块，包含 `a2a-authorization-server`、`a2a-common-permission`、`a2a-security-starter`  
+> **版本兼容性**：Spring Boot 3.5.x、Spring Cloud Alibaba 2025.0.0.0、Spring Authorization Server 1.5.7、Spring AI Alibaba 1.1.2.2、Nacos 3.2.1
+
+---
+## 目录
+
+1. [封闭内网中 AI Agent 权限体系的必要性](#1-封闭内网中-ai-agent-权限体系的必要性)  
+2. [核心目标](#2-核心目标)  
+3. [总体架构与模块划分](#3-总体架构与模块划分)  
+4. [模块间依赖关系](#4-模块间依赖关系)  
+5. [模块内核心对外接口](#5-模块内核心对外接口)  
+6. [数据模型设计](#6-数据模型设计)  
+7. [核心权限流程链路](#7-核心权限流程链路)  
+8. [配置与部署视图](#8-配置与部署视图)  
+9. [审计日志设计](#9-审计日志设计)  
+10. [安全加固矩阵](#10-安全加固矩阵)  
+11. [扩展点设计](#11-扩展点设计)  
+12. [响应式与非阻塞编程指南](#12-响应式与非阻塞编程指南)  
+13. [总结](#13-总结)
 
 ---
 ## 1. 封闭内网中 AI Agent 权限体系的必要性
@@ -21,7 +38,6 @@
 > **结论**：在封闭内网中，AI Agent 权限体系不是可选项，而是 Day 1 必须建设的核心基础设施。
 
 ---
-
 ## 2. 核心目标
 
 A2A 权限系统的设计围绕以下 **七大核心目标** 展开：
@@ -94,7 +110,7 @@ a2a-security/                         # 父 POM (groupId=io.github.latcn, artifa
            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ 外部依赖：                                                       │
-│ - Spring AI Alibaba A2A (1.0.0.4+)                             │
+│ - Spring AI Alibaba A2A (1.1.2.2+)                             │
 │ - Spring Cloud Alibaba Nacos Discovery (2023.0.x 对应 2.2.10+) │
 │ - Spring Security OAuth2 Resource Server / Client              │
 │ - Spring Boot Starter Data Redis Reactive                      │
@@ -153,19 +169,6 @@ public interface PermissionChecker {
 }
 ```
 
-**数据库表**：
-```sql
-CREATE TABLE user_resource_permission (
-    id UUID PRIMARY KEY,
-    user_id VARCHAR(64) NOT NULL,
-    resource_id VARCHAR(128) NOT NULL,
-    operation VARCHAR(32) NOT NULL,
-    granted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (user_id, resource_id, operation)
-);
-CREATE INDEX idx_user_resource ON user_resource_permission(user_id, resource_id);
-```
-
 **三级缓存架构**（查询顺序：L1 → L2 → L3，并逐级回写）：
 - L1：Caffeine 本地缓存（纳秒级），TTL 5 分钟，最大 10000 条。
 - L2：Redis 分布式缓存（毫秒级），TTL 30 分钟。
@@ -192,34 +195,6 @@ public Mono<Boolean> hasPermission(String userId, String resourceId, String oper
                 })
         );
 }
-```
-
-**批量查询实现**：
-```java
-@Override
-public Mono<Map<String, Boolean>> hasPermissions(String userId, List<String> resourceIds, String operation) {
-    if (resourceIds.isEmpty()) return Mono.just(Map.of());
-    return repository.findAllByUserIdAndResourceIdInAndOperation(userId, resourceIds, operation)
-        .map(perm -> perm.getResourceId())
-        .collectList()
-        .map(allowed -> resourceIds.stream().collect(Collectors.toMap(id -> id, allowed::contains)));
-}
-```
-
-**`user_consent` 表（支持有效期）**：
-```sql
-CREATE TABLE user_consent (
-    id UUID PRIMARY KEY,
-    user_id VARCHAR(64) NOT NULL,
-    client_id VARCHAR(64) NOT NULL,
-    scope_prefix VARCHAR(256) NOT NULL,
-    granted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    revoked_at TIMESTAMP NULL,
-    expires_at TIMESTAMP NULL,
-    UNIQUE (user_id, client_id, scope_prefix, revoked_at)
-);
--- 查询有效同意：
--- revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
 ```
 
 ### 5.2 `a2a-security-starter` 模块
@@ -833,59 +808,423 @@ public class ClientSettingsRepository {
 }
 ```
 
-#### 5.3.6 数据库表（授权服务器专用）
+---
+## 6. 数据模型设计
 
-```sql
--- ACL 表
-CREATE TABLE a2a_acl (
-    id UUID PRIMARY KEY,
-    caller_client_id VARCHAR(64) NOT NULL,
-    target_client_id VARCHAR(64) NOT NULL,
-    allowed_scope_prefixes TEXT NOT NULL,  -- 逗号分隔，空字符串或 null 表示拒绝
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (caller_client_id, target_client_id)
-);
-CREATE INDEX idx_caller_target ON a2a_acl(caller_client_id, target_client_id);
+### 6.1 设计原则
 
--- 用户同意表（含有效期）
-CREATE TABLE user_consent (
-    id UUID PRIMARY KEY,
-    user_id VARCHAR(64) NOT NULL,
-    client_id VARCHAR(64) NOT NULL,
-    scope_prefix VARCHAR(256) NOT NULL,
-    granted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    revoked_at TIMESTAMP NULL,
-    expires_at TIMESTAMP NULL,
-    UNIQUE (user_id, client_id, scope_prefix, revoked_at)
-);
-CREATE UNIQUE INDEX idx_user_consent_active ON user_consent (user_id, client_id, scope_prefix) WHERE revoked_at IS NULL;
+- **最小权限**：支持资源实例级、操作级、分类级授权。
+- **高性能**：通过分类批量授权减少数据库查询，使用三级缓存。
+- **可审计**：所有权限决策记录审计日志。
+- **可扩展**：支持特例覆盖（ALLOW/DENY）和动态策略变更。
+- **无外键约束**：应用层维护一致性，避免数据库级联锁定。
 
--- 客户端扩展表
-CREATE TABLE oauth2_client_settings (
-    client_id VARCHAR(64) PRIMARY KEY,
-    allowed_subject_token_types TEXT,   -- JSON 数组
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+### 6.2 核心表作用概览
 
-#### 5.3.7 审计日志增强
+| 表名 | 作用 |
+|------|------|
+| `resource_category` | 定义资源分类（如财务文档、技术文档），支持树形结构 |
+| `resource` | 资源实例表，记录每个资源所属的分类 |
+| `user_category_permission` | 用户对资源分类的批量授权（支持操作粒度和通配符） |
+| `user_resource_permission` | 用户对特定资源实例的特例授权（覆盖分类权限），支持 ALLOW/DENY |
+| `a2a_acl` | Agent 间调用访问控制，定义调用方 Agent 对目标 Agent 的 Scope 权限 |
+| `user_consent` | 用户委派授权，记录用户同意 Agent 代表自己执行某类操作 |
+| `oauth2_client_settings` | Agent（OAuth2 客户端）的安全配置（信任级别、令牌类型白名单） |
+| `a2a_audit_log` | 所有权限决策的审计日志，包含全链路追踪信息 |
 
-```sql
-ALTER TABLE a2a_audit_log ADD COLUMN bulk_mode BOOLEAN DEFAULT FALSE;
-ALTER TABLE a2a_audit_log ADD COLUMN bulk_partial BOOLEAN DEFAULT FALSE;
-```
+### 6.3 表结构详细定义
 
-#### 5.3.8 JwtDecoder 配置（授权服务器用）
+#### 6.3.1 `resource_category` — 资源分类定义
 
-```java
-@Bean
-public JwtDecoder jwtDecoder() {
-    return NimbusJwtDecoder.withJwkSetUri("https://auth.internal.example.com/oauth2/jwks").build();
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | 分类唯一标识 |
+| `category_name` | VARCHAR(128) | NOT NULL | 分类名称，如 `financial_report` |
+| `resource_type` | VARCHAR(64) | NOT NULL | 资源类型，如 `document`、`table` |
+| `parent_id` | UUID | NULL | 父分类 ID，支持树形结构 |
+| `description` | TEXT | | 分类描述 |
+| `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
+| `created_by` | VARCHAR(64) | | 创建人 ID |
+| UNIQUE | (category_name, resource_type) | | 分类名称在资源类型内唯一 |
+
+**索引**：主键索引，`(resource_type, parent_id)` 索引。
+
+#### 6.3.2 `resource` — 资源实例表
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | 资源唯一标识 |
+| `resource_type` | VARCHAR(64) | NOT NULL | 资源类型，与 `resource_category.resource_type` 对应 |
+| `resource_id` | VARCHAR(128) | NOT NULL | 业务资源实例 ID（如文档 UUID） |
+| `category_id` | UUID | NOT NULL | 所属分类 ID，关联 `resource_category.id` |
+| `properties` | JSONB | | 资源扩展属性（如密级、创建时间等） |
+| `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
+| UNIQUE | (resource_type, resource_id) | | 确保资源实例唯一 |
+| INDEX | `idx_resource_category` ON (category_id) | | 按分类查询资源 |
+
+**设计说明**：一个资源实例只属于一个分类（一对一），简化权限判断，避免多分类冲突。
+
+#### 6.3.3 `user_category_permission` — 用户对分类的批量授权
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | 记录唯一标识 |
+| `user_id` | VARCHAR(64) | NOT NULL | 用户 ID |
+| `category_id` | UUID | NOT NULL | 资源分类 ID |
+| `operation` | VARCHAR(32) | NOT NULL | 操作类型，`'*'` 表示该分类下所有操作 |
+| `granted_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 授权时间 |
+| `expires_at` | TIMESTAMPTZ | NULL | 过期时间，NULL 表示永不过期 |
+| UNIQUE | (user_id, category_id, operation) | | 防止重复授权 |
+| INDEX | `idx_user_category` ON (user_id, category_id) | | 按用户+分类查询 |
+| INDEX | `idx_category_user` ON (category_id, user_id) | | 按分类+用户查询（管理用） |
+
+#### 6.3.4 `user_resource_permission` — 用户对特定资源实例的特例授权
+
+> 该表用于覆盖分类权限，实现资源实例级的允许或拒绝。优先级最高。
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | |
+| `user_id` | VARCHAR(64) | NOT NULL | 用户 ID |
+| `resource_type` | VARCHAR(64) | NOT NULL | 资源类型，如 `document`、`table` |
+| `resource_id` | VARCHAR(128) | NOT NULL | 资源实例 ID |
+| `operation` | VARCHAR(32) | NOT NULL | 操作类型，`'*'` 表示所有操作 |
+| `effect` | VARCHAR(8) | NOT NULL CHECK (effect IN ('ALLOW', 'DENY')) | 允许或拒绝 |
+| `granted_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 授权时间 |
+| `revoked_at` | TIMESTAMPTZ | NULL | 撤销时间，NULL 表示有效 |
+| `expires_at` | TIMESTAMPTZ | NULL | 过期时间，NULL 表示永不过期 |
+| UNIQUE | (user_id, resource_type, resource_id, operation, revoked_at) | | 支持多版本历史 |
+| INDEX | `idx_permission_resource` ON (resource_type, resource_id) | | 按资源查询 |
+| PARTIAL UNIQUE INDEX | `idx_permission_active` ON (user_id, resource_type, resource_id, operation) WHERE revoked_at IS NULL | | 保证最多一条有效特例 |
+
+#### 6.3.5 `a2a_acl` — Agent 间调用访问控制
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | |
+| `caller_client_id` | VARCHAR(64) | NOT NULL | 调用方 Agent ID |
+| `target_client_id` | VARCHAR(64) | NOT NULL | 目标 Agent ID |
+| `allowed_scope_patterns` | TEXT | NOT NULL | 允许的 Scope 模式，支持 `*` 通配符，逗号分隔。单行建议不超过 4096 字符 |
+| `denied_scope_patterns` | TEXT | | 拒绝的 Scope 模式，优先级高于 allowed。单行建议不超过 4096 字符 |
+| `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | |
+| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 应用层在更新时需手动设置此字段 |
+| UNIQUE | (caller_client_id, target_client_id) | | 每对调用关系唯一 |
+| INDEX | `idx_caller_target` ON (caller_client_id, target_client_id) | | |
+
+**Scope 模式匹配规则**：
+- 支持前缀匹配（如 `doc:` 匹配 `doc:read`、`doc:summarize`）
+- 支持通配符 `*`（如 `doc:read:*` 匹配 `doc:read:report-123`）
+- 算法：将模式按 `:` 分割，每段支持 `*`；先检查 `denied` 列表，如有匹配则拒绝；否则检查 `allowed` 列表，如有匹配则允许；否则拒绝。
+
+#### 6.3.6 `user_consent` — 用户委派授权
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | |
+| `user_id` | VARCHAR(64) | NOT NULL | 用户 ID |
+| `client_id` | VARCHAR(64) | NOT NULL | 被授权的 Agent ID |
+| `scope_prefix` | VARCHAR(256) | NOT NULL | 授权的 Scope 前缀（如 `doc:read`） |
+| `granted_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 授权时间 |
+| `revoked_at` | TIMESTAMPTZ | NULL | 撤销时间，NULL 表示有效 |
+| `expires_at` | TIMESTAMPTZ | NULL | 过期时间，NULL 表示永不过期 |
+| `consent_context` | JSONB | | 环境上下文：`{"ip":"...", "user_agent":"...", "location":"..."}` |
+| UNIQUE | (user_id, client_id, scope_prefix, revoked_at) | | 支持多版本历史 |
+| PARTIAL UNIQUE INDEX | `idx_consent_active` ON (user_id, client_id, scope_prefix) WHERE revoked_at IS NULL | | 保证最多一条有效授权 |
+| INDEX | `idx_consent_user` ON (user_id, revoked_at) | | 查询用户的有效授权 |
+| INDEX | `idx_consent_client` ON (client_id, revoked_at) | | 查询某 Agent 的授权 |
+| INDEX | `idx_consent_expires` ON (expires_at) | | 用于清理过期记录 |
+
+**注意**：`consent_context` 仅存储环境信息，不存储资源分类或资源 ID；资源实例权限由 `user_category_permission` 和 `user_resource_permission` 管理。
+
+#### 6.3.7 `oauth2_client_settings` — 客户端安全配置
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `client_id` | VARCHAR(64) | PRIMARY KEY | Agent 的 client_id |
+| `allowed_subject_token_types` | TEXT | | JSON 数组，如 `["access_token","jwt"]` |
+| `trust_level` | VARCHAR(16) | DEFAULT 'INTERNAL' CHECK (trust_level IN ('INTERNAL', 'PARTNER', 'PUBLIC')) | 信任级别 |
+| `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | |
+| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 应用层手动更新 |
+
+**信任级别语义**：
+- `INTERNAL`：完全信任，可跳过一次性令牌等额外检查
+- `PARTNER`：标准安全检查
+- `PUBLIC`：最严格，要求 DPoP 或 mTLS 等增强认证
+
+#### 6.3.8 `a2a_audit_log` — 审计日志
+
+| 字段 | 类型 | 约束 | 描述 |
+|------|------|------|------|
+| `id` | UUID | PRIMARY KEY | |
+| `timestamp` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | |
+| `service_type` | VARCHAR(16) | NOT NULL | `AUTHZ` 或 `AGENT` |
+| `caller_agent_id` | VARCHAR(64) | | 调用方 Agent ID |
+| `target_agent_id` | VARCHAR(64) | | 目标 Agent ID |
+| `user_id` | VARCHAR(64) | | 最终用户 ID（委派场景） |
+| `scope` | VARCHAR(256) | | 请求的 Scope |
+| `trace_id` | VARCHAR(64) | NOT NULL | 全链路追踪 ID |
+| `jti` | VARCHAR(64) | | JWT ID |
+| `decision` | VARCHAR(16) | NOT NULL | `ALLOW` 或 `DENY` |
+| `deny_reason` | VARCHAR(64) | | 拒绝原因（如 `ACL_MISMATCH`、`TOKEN_EXPIRED`） |
+| `http_status` | INT | | HTTP 状态码 |
+| `bulk_mode` | BOOLEAN | DEFAULT FALSE | 是否批量授权模式 |
+| `bulk_partial` | BOOLEAN | DEFAULT FALSE | 批量模式下是否部分拒绝 |
+| `details` | JSONB | | 结构化附加信息，遵循标准 schema |
+| INDEX | `idx_trace_id` ON (trace_id) | | |
+| INDEX | `idx_jti` ON (jti) | | |
+| INDEX | `idx_timestamp` ON (timestamp) | | |
+
+**`details` 标准 JSON Schema**：
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "client_ip": { "type": "string" },
+    "user_agent": { "type": "string" },
+    "jti": { "type": "string" },
+    "request_params": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "脱敏后的请求参数（不含 client_secret, subject_token）"
+    }
+  },
+  "required": ["client_ip"]
 }
 ```
 
-#### 5.3.9 授权服务器配置
+**防篡改机制**：不在数据库内维护哈希链，而是将审计日志同步到外部不可变存储（如 AWS S3 Object Lock、WAL 归档），定期进行哈希校验。
+
+### 6.4 权限优先级规则（应用层实现）
+
+1. **特例授权**（`user_resource_permission`）  
+   - 查询条件：`user_id = ? AND resource_type = ? AND resource_id = ? AND operation IN (?, '*') AND effect = 'DENY' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`  
+   - 存在则直接拒绝。
+   - 同理查询 `effect = 'ALLOW'`，存在则直接允许。
+
+2. **分类批量授权**（`user_category_permission`）  
+   - 通过 `resource.category_id` 获取资源所属分类。
+   - 检查：`user_id = ? AND category_id = ? AND (operation = ? OR operation = '*') AND (expires_at IS NULL OR expires_at > NOW())`。
+   - 匹配则允许。若存在 `operation='*'` 记录，视为该分类下所有操作均已授权。
+
+3. **Agent 间 ACL**（`a2a_acl`）  
+   - 仅用于 Token Exchange 时的 Agent 授权评估，不涉及用户资源。
+   - 先检查 `denied_scope_patterns`，再检查 `allowed_scope_patterns`。
+
+4. **默认拒绝**。
+
+### 6.5 数据一致性保障（无外键约束）
+
+应用层负责维护数据完整性，所有跨表操作应在同一数据库事务中完成：
+
+- **删除资源时**：删除 `resource` 表中对应行，同时删除 `user_resource_permission` 中相关行。
+- **删除分类时**：检查是否有资源仍引用该分类（可通过 `resource.category_id`），如有则阻止删除或级联更新为 NULL。
+- **删除客户端（Agent）时**：删除 `a2a_acl` 中涉及该 `client_id` 的行、`user_consent` 中 `client_id` 的行，以及 `oauth2_client_settings` 中对应的行。
+- **更新 `updated_at` 字段**：每次更新行时，应用层应显式设置 `updated_at = NOW()`（或使用数据库触发器）。
+
+### 6.6 性能优化建议
+
+- 对 `resource` 表的 `category_id` 建立索引，加速按分类查询资源。
+- 高频访问的资源分类信息可在应用层缓存（Caffeine 本地缓存，TTL 5 分钟）。
+- `user_category_permission` 查询通过 `(user_id, category_id)` 索引加速。
+- 分类数量通常较少（< 100），权限判断循环开销可忽略。
+- 审计日志建议使用分区表（按月）和异步写入，避免影响主业务。
+
+### 6.7 迁移策略
+
+- 使用 **Flyway** 或 **Liquibase** 管理数据库 schema 变更，所有迁移脚本存放在 `db/migration` 目录。
+- 命名规范：`V{版本号}__{描述}.sql`，例如 `V1__initial_schema.sql`。
+- **向后兼容原则**：禁止删除列或修改已有列类型；新加列需有默认值或允许 NULL；索引添加使用 `CONCURRENTLY` 避免锁表。
+- 从旧模型（多对多分类映射）迁移到新模型（单分类）时，需先为每个资源确定唯一分类，再执行表结构变更。
+
+### 6.8 附录：超大 JWT 声明的可选方案
+
+如确需在 JWT 中携带超过 300 个资源 ID（原则上建议避免），可采用 Redis 缓存方案：
+1. 授权服务器生成唯一 key（如 `jwt:claim:{uuid}`），将大数据存入 Redis，TTL 等于 JWT 有效期。
+2. JWT 中携带 `claim_ref: { "key": "...", "hash": "sha256(...)" }`。
+3. 资源服务器根据 `claim_ref` 从 Redis 读取数据，并校验哈希。
+
+此方案会增加网络依赖，仅在必要时启用。
+
+---
+
+## 7. 核心权限流程链路
+
+### 7.1 链路一：纯 Agent 直连（无用户委派）
+
+```mermaid
+sequenceDiagram
+    participant AgentA
+    participant Authz
+    participant Redis
+    participant AgentB
+    participant AuditDB
+
+    AgentA->>Authz: POST /oauth2/token (grant_type=token_exchange, scope=doc:read, resource_instance=doc-123, single_use=true)
+    Authz->>Authz: 校验 client_id/secret
+    Authz->>Authz: 校验 client自身 scope（clientScopes 包含请求 scope）
+    Authz->>Authz: 查询 a2a_acl WHERE caller=agentA AND target=agentB
+    alt ACL 无匹配或 denied_patterns 匹配
+        Authz-->>AgentA: 403 Forbidden
+    else ACL 允许
+        Authz->>Authz: 生成 JWT (sub=agentA, aud=agentB, jti=uuid, single_use, resource_instance=doc-123, exp=now+2m)
+        Authz->>AuditDB: INSERT a2a_audit_log (decision=ALLOW, jti, trace_id, bulk_mode=false)
+        Authz-->>AgentA: access_token
+    end
+    AgentA->>AgentB: POST /message (Authorization: Bearer <token>, X-Trace-Id: xxx)
+    AgentB->>AgentB: 验签、校验 issuer/aud
+    AgentB->>Redis: SET NX a2a:agentB:onetoken:<jti> 1 EX <剩余秒数>
+    alt Redis 返回 0 (已使用)
+        AgentB-->>AgentA: 403 Token already used
+    else 成功占用
+        AgentB->>AgentB: 提取 scope=doc:read, resource_instance=doc-123
+        AgentB->>AgentB: 调用业务逻辑（处理文档）
+        AgentB->>AuditDB: INSERT a2a_audit_log (service_type=AGENT, decision=ALLOW)
+        AgentB-->>AgentA: 200 OK
+    end
+```
+
+### 7.2 链路二：用户委派流程（含资源权限检查）
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant AgentA
+    participant Authz
+    participant ConsentDB
+    participant PermDB
+    participant AgentB
+    participant AuditDB
+
+    User->>AgentA: 请求 + user_access_token
+    AgentA->>Authz: Token Exchange (subject_token=user_token, scope=doc:read, resource_instance=doc-123)
+    Authz->>Authz: 校验 client 自身 scope
+    Authz->>Authz: 解析 user_token（JWT 或内省），提取 userId
+    Authz->>ConsentDB: SELECT * FROM user_consent WHERE user_id=U AND client_id=agentA AND scope_prefix='doc:read' AND revoked IS NULL AND (expires IS NULL OR expires>NOW())
+    alt 无有效同意
+        Authz-->>AgentA: 400 need_consent
+    else 同意有效
+        Authz->>Authz: 查询 a2a_acl（同链路一）
+        alt ACL 拒绝
+            Authz-->>AgentA: 403
+        else ACL 允许
+            Authz->>PermDB: 查询资源所属分类：SELECT category_id FROM resource WHERE resource_type='document' AND resource_id='doc-123'
+            Authz->>PermDB: 用户分类权限：user_category_permission WHERE user_id=U AND category_id=? AND (operation='doc:read' OR operation='*') AND expires条件
+            alt 分类权限通过
+                Authz->>Authz: 生成 JWT (sub=agentA, act={sub:userId}, allowed_resource_ids=[doc-123])
+                Authz->>AuditDB: 审计日志（含 user_id）
+                Authz-->>AgentA: 代理令牌
+            else 分类权限不足，检查特例
+                Authz->>PermDB: user_resource_permission WHERE user_id=U AND resource_id='doc-123' AND operation='doc:read' AND effect='ALLOW'
+                alt 特例允许
+                    Authz->>Authz: 生成代理令牌
+                else 特例拒绝或不存在
+                    Authz-->>AgentA: 403
+                end
+            end
+        end
+    end
+    AgentA->>AgentB: A2A 请求 + 令牌
+    AgentB->>AgentB: 验证令牌，提取 act.sub 作为 userId，校验 resource_instance
+    AgentB->>PermDB: （可选降级）hasPermission(userId, doc-123, doc:read)
+    AgentB-->>AgentA: 响应
+```
+
+### 7.3 链路三：批量任务优化流程
+
+```mermaid
+sequenceDiagram
+    participant AgentA
+    participant Authz
+    participant PermDB
+    participant AgentB
+
+    AgentA->>Authz: Token Exchange (scope=doc:read, resource_instances=id1,id2,...,id100, single_use=false)
+    Authz->>Authz: 校验 ACL 和用户同意（同链路二）
+    Authz->>PermDB: 查询资源所属分类（批量获取 category_id），然后查询 user_category_permission 或 user_resource_permission
+    Note over Authz: 批量权限预计算：对每个资源判断，得到 allowed_ids 列表
+    PermDB-->>Authz: allowed_ids = [id1, id3, id5, ...]（假设 60 个）
+    Authz->>Authz: 生成 JWT，携带 claim allowed_resource_ids = [id1,id3,...]，并设置 bulk_partial=true（若 60<100）
+    Authz-->>AgentA: 代理令牌
+    AgentA->>AgentB: 批量请求 + JWT（请求体包含 id1..id100）
+    AgentB->>AgentB: 解析 JWT 中的 allowed_resource_ids，对每个请求的 id 校验是否在列表中
+    Note over AgentB: 零数据库查询，60 个允许，40 个拒绝
+    AgentB-->>AgentA: 返回部分成功响应
+```
+
+### 7.4 链路四：多跳委托
+
+```mermaid
+sequenceDiagram
+    participant AgentA
+    participant Authz
+    participant AgentB
+    participant AgentC
+    participant AuditDB
+
+    AgentA->>Authz: Token Exchange (resource=agentB)
+    Authz-->>AgentA: 令牌1 (delegation_remaining=3, chain=[])
+    AgentA->>AgentB: 请求 + 令牌1
+    AgentB->>AgentB: 从 SecurityContext 获取令牌1，调用 DelegationContextHandler
+    AgentB->>Authz: Token Exchange (subject_token=令牌1, resource=agentC)
+    Authz->>Authz: 解析 subject_token，提取 delegation_remaining=3，计算新值=2；chain 追加 "agentB"
+    Authz-->>AgentB: 令牌2 (delegation_remaining=2, chain=["agentB"])
+    AgentB->>AgentC: 请求 + 令牌2
+    AgentC->>AgentC: 业务处理，不再委托
+    AgentC->>AuditDB: 审计日志（记录 delegation_chain）
+```
+
+### 7.5 数据流转总图
+
+```mermaid
+flowchart TD
+    subgraph Client_Side["调用方 Agent (Client)"]
+        A1[业务代码] --> A2[A2aClientFilter]
+        A2 --> A3[TokenExchangeService]
+    end
+
+    subgraph Auth_Server["授权服务器"]
+        B1[Token Exchange 端点] --> B2[ClientScopeValidator]
+        B2 --> B3{ACL 检查}
+        B3 -->|允许| B4[UserConsent 检查]
+        B4 --> B5[批量权限预计算]
+        B5 --> B6[CustomJwtCustomizer]
+        B6 --> B7[生成代理令牌 + 审计]
+    end
+
+    subgraph Resource_Server["资源 Agent (Resource Server)"]
+        C1[A2AJwtAuthenticationFilter] --> C2{一次性令牌校验}
+        C2 -->|通过| C3[Scope & 资源实例校验]
+        C3 --> C4[降级权限检查]
+        C4 --> C5[业务处理]
+    end
+
+    subgraph Data_Store["数据存储层"]
+        D1[(resource / user_category_permission / user_resource_permission)]
+        D2[(a2a_acl)]
+        D3[(user_consent)]
+        D5[(a2a_audit_log)]
+        D6[(Redis 一次性令牌)]
+        D7[(Nacos AgentCard)]
+    end
+
+    A3 -- Token Exchange 请求 --> B1
+    B3 -- 查询 --> D2
+    B4 -- 查询 --> D3
+    B5 -- 查询资源分类及用户权限 --> D1
+    B7 -- 写入审计 --> D5
+    A2 -- A2A 请求 + Bearer Token --> C1
+    C2 -- SET NX --> D6
+    C4 -- 降级查询用户权限 --> D1
+    C1 -- 审计决策 --> D5
+    A1 -- 读取 AgentCard --> D7
+```
+
+---
+
+## 8. 配置与部署视图
+
+### 8.1 授权服务器配置
 
 ```yaml
 spring:
@@ -928,133 +1267,7 @@ a2a:
       agent-a: ["access_token", "jwt"]
 ```
 
----
-## 6. 核心权限流程链路
-
-### 6.1 批量任务优化流程
-
-```mermaid
-sequenceDiagram
-    participant AgentA as Agent A
-    participant Authz as 授权服务器
-    participant PermSvc as 权限服务(DB)
-    participant AgentB as Agent B
-
-    AgentA->>Authz: Token Exchange (scope, resource_instances=id1,...,id100)
-    Authz->>PermSvc: SELECT resource_id FROM ... WHERE user_id=? AND operation=? AND resource_id IN (...)
-    PermSvc-->>Authz: allowed_ids (id1,id3,id5,...)
-    Authz->>Authz: 生成 JWT (allowed_resource_ids=[...], bulk_partial=true)
-    Authz-->>AgentA: 代理令牌
-    AgentA->>AgentB: 批量请求 + JWT
-    AgentB->>AgentB: 解析 JWT，本地校验 each docId in allowed_ids
-    Note over AgentB: 零数据库查询，处理100个文档
-```
-
-### 6.2 纯 Agent 直连（无用户委派）
-
-```mermaid
-sequenceDiagram
-    participant AgentA as Agent A (客户端)
-    participant Authz as 授权服务器
-    participant Redis as Redis
-    participant AgentB as Agent B (资源服务器)
-
-    AgentA->>AgentA: 生成 trace_id (UUID)
-    AgentA->>Authz: Token Exchange (client_id+secret, scope, single_use=true, resource=targetResourceUri, resource_instance=..., trace_id)
-    Authz->>Authz: 验证客户端凭证 & 客户端自身 scope 权限
-    Authz->>Authz: 查询 ACL（判空处理）
-    alt ACL 拒绝
-        Authz-->>AgentA: 403
-    else ACL 允许
-        Authz->>Authz: 生成 JWT (sub=AgentA, aud=resource, jti=UUID, single_use, resource_instance, trace_id, exp=now+2m)
-        Authz->>Authz: 记录审计日志（含 jti, client_ip, user_agent）
-        Authz-->>AgentA: 代理令牌
-    end
-    AgentA->>AgentB: A2A /message (Bearer token, X-Trace-Id: trace_id)
-    AgentB->>AgentB: 验证签名/有效期/issuer/aud (包含自身 resource-id)
-    opt single_use
-        AgentB->>AgentB: remaining = max(exp - now + clockSkew, 1)
-        AgentB->>Redis: SET NX a2a:agent-b:onetoken:<jti> 1 EX remaining
-        alt 已使用或 Redis 故障 (fail-open=false)
-            AgentB-->>AgentA: 403
-        end
-    end
-    AgentB->>AgentB: 提取 scope, 检查操作权限
-    AgentB->>AgentB: 业务处理
-    AgentB-->>AgentA: 200 OK
-```
-
-### 6.3 用户委派流程
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant AgentA
-    participant Authz
-    participant Redis
-    participant AgentB
-    participant Perm
-
-    User->>AgentA: 请求 + user_token
-    AgentA->>AgentA: 提取 user_token, trace_id
-    AgentA->>Authz: Token Exchange (subject_token, subject_token_type=access_token, scope, resource=targetResourceUri, resource_instance=..., single_use, trace_id)
-    Authz->>Authz: 验证客户端凭证 & 自身 scope
-    Authz->>Authz: 验证 subject_token (JWT 或内省)
-    Authz->>Authz: 查询 user_consent
-    alt 无同意
-        Authz-->>AgentA: 需授权
-    else 同意通过
-        Authz->>Authz: 查询 ACL
-        alt ACL 允许
-            Authz->>Authz: 生成 JWT (sub=AgentA, act={sub:user_id, iss}, aud=resource, jti, single_use, resource_instance, trace_id, exp=now+2m)
-            Authz-->>AgentA: 代理令牌
-        else ACL 拒绝
-            Authz-->>AgentA: 403
-        end
-    end
-    AgentA->>AgentB: A2A 请求 (Bearer token, X-Trace-Id)
-    AgentB->>AgentB: 验证 JWT + 一次性令牌
-    AgentB->>AgentB: 提取 act.sub 作为 userId, resource_instance
-    AgentB->>Perm: hasPermission(userId, resource_instance, operation)
-    Perm-->>AgentB: true/false
-    alt 权限不足
-        AgentB-->>AgentA: 403
-    else 权限允许
-        AgentB->>AgentB: 调用大模型
-        AgentB-->>AgentA: 200
-    end
-    AgentA-->>User: 响应
-```
-
-### 6.4 多跳委托流程
-
-```mermaid
-sequenceDiagram
-    participant AgentA
-    participant Authz
-    participant AgentB
-    participant AgentC
-
-    AgentA->>Authz: Token Exchange (resource=agent-b)
-    Authz-->>AgentA: 令牌1 (delegation_remaining=null, chain=[])
-    AgentA->>AgentB: 请求（令牌1）
-    AgentB->>AgentB: 从 SecurityContext 获取令牌1，调用 DelegationContextHandler
-    AgentB->>Authz: Token Exchange (subject_token=令牌1, resource=agent-c)
-    Authz->>Authz: 验证 subject_token，提取 delegation_remaining=3（若 null 则用 max-depth=3），减1得2；链追加 "agent-b"
-    Authz-->>AgentB: 新令牌 (delegation_remaining=2, chain=["agent-b"])
-    AgentB->>AgentC: 请求
-    AgentC->>AgentC: 处理，不再委托
-```
-
----
-
-## 7. 配置与部署视图
-
-### 7.1 授权服务器配置
-
-（同 5.3.9）
-
-### 7.2 Agent 配置（完整示例）
+### 8.2 Agent 配置（完整示例）
 
 ```yaml
 spring:
@@ -1077,6 +1290,18 @@ spring:
       resourceserver:
         jwt:
           issuer-uri: https://auth.internal.example.com
+  ai:
+    alibaba:
+      a2a:
+        server:
+          base-path: /a2a        # Agent 端点变为 /a2a/message
+          agent-id: agent-b
+        client:
+          web-client:
+            filter-chain:
+              - io.github.latcn.a2a.security.agent.client.A2aClientFilter
+        nacos:
+          enabled: true           # 自动发布 AgentCard
 a2a:
   security:
     enabled: true
@@ -1097,7 +1322,7 @@ a2a:
       enabled: true
       max-depth: 3
     scope-matcher: prefix
-    a2a-path-pattern: "/message"
+    a2a-path-pattern: "/a2a/message"   # 与 server.base-path 保持一致
     jwt:
       local-verification: true
       jwks-cache-ttl: 12h
@@ -1118,7 +1343,7 @@ permission:
       password: ${PERM_DB_PASS}
 ```
 
-### 7.3 Nacos 服务端认证配置
+### 8.3 Nacos 服务端认证配置
 
 在 Nacos 服务端 `conf/application.properties` 中启用：
 ```properties
@@ -1137,7 +1362,7 @@ nacos:
     password: ${NACOS_PASSWORD}
 ```
 
-### 7.4 内部 Header 信任传递（RSA 签名示例）
+### 8.4 内部 Header 信任传递（RSA 签名示例）
 
 **网关签名**：
 ```java
@@ -1163,10 +1388,9 @@ Jws<Claims> jws = Jwts.parserBuilder()
 
 **密钥管理**：网关私钥存储在 KMS 中，公钥通过配置中心分发。轮换私钥时保留旧公钥一段时间（通过 `kid` 头区分），新旧切换期并行。
 
-### 7.5 A2A 端点路径对齐
+### 8.5 A2A 端点路径对齐
 
-- Spring AI Alibaba A2A 默认端点：`/message`。  
-- 若通过 `spring.ai.alibaba.a2a.server.path` 修改基础路径（如 `/a2a`），则端点为 `/a2a/message`。  
+- Spring AI Alibaba A2A 默认基础路径：`/a2a`（可通过 `spring.ai.alibaba.a2a.server.base-path` 修改），最终端点为 `/a2a/message`。  
 - 必须同步设置 `a2a.security.a2a-path-pattern` 为对应路径（支持 Ant 风格，如 `/a2a/message`）。
 
 **自定义 WebClient 注入**（在业务 Agent 中）：
@@ -1186,49 +1410,18 @@ public class A2aClientConfig {
 ```
 
 ---
-## 8. 审计日志设计
+## 9. 审计日志设计
 
-### 8.1 数据库表
+### 9.1 数据库表
 
-```sql
-CREATE TABLE a2a_audit_log (
-    id UUID PRIMARY KEY,
-    timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    service_type VARCHAR(16) NOT NULL,      -- 'AUTHZ' or 'AGENT'
-    caller_agent_id VARCHAR(64),
-    target_agent_id VARCHAR(64),
-    user_id VARCHAR(64),
-    scope VARCHAR(256),
-    trace_id VARCHAR(64) NOT NULL,
-    jti VARCHAR(64),
-    decision VARCHAR(16) NOT NULL,
-    deny_reason VARCHAR(64),
-    http_status INT,
-    bulk_mode BOOLEAN DEFAULT FALSE,
-    bulk_partial BOOLEAN DEFAULT FALSE,
-    details JSONB
-);
-CREATE INDEX idx_trace_id ON a2a_audit_log(trace_id);
-CREATE INDEX idx_jti ON a2a_audit_log(jti);
-CREATE INDEX idx_timestamp ON a2a_audit_log(timestamp);
-```
+（参见 6.3.8）
 
-**details 标准结构**：
-```json
-{
-  "jti": "uuid",
-  "client_ip": "10.0.0.1",
-  "user_agent": "Mozilla/5.0...",
-  "request_params": {}   // 已脱敏（不含 client_secret, subject_token）
-}
-```
-
-### 8.2 日志记录点
+### 9.2 日志记录点
 
 - **授权服务器**：每次 Token Exchange 请求，记录决策、`jti`、`bulk_mode`、`bulk_partial`、客户端 IP、User-Agent。  
 - **Agent 资源服务器**：每次 JWT 验证，记录决策和一次性令牌结果；若一次性令牌降级（Redis 故障且 `fail-open=true`），标记 `deny_reason=REDIS_DEGRADED`。
 
-### 8.3 可靠性保障
+### 9.3 可靠性保障
 
 - 生产环境推荐使用 **消息队列（RabbitMQ/Kafka）** 异步发送审计日志。  
 - 若使用 `@Async`，需配置线程池及 `neverBlock`，并接受潜在内存丢失风险。  
@@ -1243,7 +1436,7 @@ exchange.getAttributes().put("client_ip", ip);
 exchange.getAttributes().put("user_agent", userAgent);
 ```
 
-### 8.4 审计日志清理策略
+### 9.4 审计日志清理策略
 
 定期清理（例如每天凌晨执行）：
 ```sql
@@ -1252,7 +1445,7 @@ DELETE FROM a2a_audit_log WHERE timestamp < NOW() - INTERVAL '90 days';
 或使用时间分区表自动管理。
 
 ---
-## 9. 安全加固矩阵
+## 10. 安全加固矩阵
 
 | 安全机制 | 实现位置 | 必须 | 说明 |
 |---------|----------|------|------|
@@ -1274,9 +1467,9 @@ DELETE FROM a2a_audit_log WHERE timestamp < NOW() - INTERVAL '90 days';
 | mTLS / DPoP | 可选扩展 | ❌ | 按需开启 |
 
 ---
-## 10. 扩展点设计
+## 11. 扩展点设计
 
-### 10.1 自定义 Scope 匹配策略
+### 11.1 自定义 Scope 匹配策略
 
 ```java
 public interface ScopeMatcher {
@@ -1305,7 +1498,7 @@ public class RegexScopeMatcher implements ScopeMatcher {
 }
 ```
 
-### 10.2 自定义用户身份提取
+### 11.2 自定义用户身份提取
 
 ```java
 public interface UserIdentityExtractor {
@@ -1326,7 +1519,7 @@ public class DefaultUserIdentityExtractor implements UserIdentityExtractor {
 }
 ```
 
-### 10.3 自定义一次性令牌存储
+### 11.3 自定义一次性令牌存储
 
 ```java
 @Component
@@ -1336,13 +1529,13 @@ public class DatabaseOneTimeTokenValidator implements OneTimeTokenValidator {
 }
 ```
 
-### 10.4 mTLS 与 DPoP 集成
+### 11.4 mTLS 与 DPoP 集成
 
 - **mTLS**：配置 `a2a.security.mtls.enabled=true`，支持 `mode: only_mtls` 或 `mode: dual`。证书 CN/SAN 映射为 `client_id`，可配置正则表达式。
 - **DPoP**：配置 `a2a.security.dpop.enabled=true`，使用 Spring Security 的 `DPoPAuthenticationConverter`。授权服务器需支持在 Token Exchange 响应中返回 `cnf` 声明（RFC 7800）。
 
 ---
-## 11. 响应式与非阻塞编程指南
+## 12. 响应式与非阻塞编程指南
 
 - 所有安全组件返回 `Mono`/`Flux`，遵循 WebFlux 模型。  
 - 若使用阻塞式数据库（JDBC），必须用 `Mono.fromCallable(() -> ...).subscribeOn(Schedulers.boundedElastic())`。  
@@ -1362,6 +1555,14 @@ public PermissionChecker permissionChecker(JdbcTemplate jdbcTemplate) {
 **R2DBC 事务**：使用 `TransactionalOperator` 或 `@Transactional` 配合 `ReactiveTransactionManager`。
 
 ---
-## 12. 总结
+## 13. 总结
 
-本文档是 A2A 权限系统的完整架构设计，涵盖了身份认证、最小权限、性能优化、可审计性、高可用性、动态策略和联邦互操作七大目标。经过多轮迭代修复，所有事实错误和关键遗漏均已解决，文档可直接用于生产级 A2A 权限系统的开发、部署与运维。
+本文档是 A2A 权限系统的完整架构设计，涵盖了身份认证、最小权限、性能优化、可审计性、高可用性、动态策略和联邦互操作七大目标。经过多轮迭代修复，所有事实错误和关键遗漏均已解决，数据模型采用 **资源实例单分类** 设计，简化了权限判断逻辑并提升了性能。文档可直接用于生产级 A2A 权限系统的开发、部署与运维。
+
+| 核心能力 | 实现方式 | 数据表关键字段 |
+|---------|----------|---------------|
+| Agent 间调用授权 | ACL + 自身 scope 校验 | `a2a_acl.allowed_scope_patterns` |
+| 用户委派授权 | 用户同意表 + 资源权限表 | `user_consent.scope_prefix`、`user_resource_permission.effect` |
+| 批量资源优化 | 批量 Token Exchange + JWT 内嵌列表 | `user_category_permission`、`user_resource_permission` |
+| 多跳委托限制 | 委托链传递 + 深度计数 | JWT 声明 `delegation_remaining`、`delegation_chain` |
+| 全链路审计 | 异步日志 + 不可变存储 | `a2a_audit_log.trace_id`、`jti` |
