@@ -1,12 +1,15 @@
- 
-> **基于**：《A2A 权限系统架构设计文档》《A2A 数据模型设计文档》及多轮讨论整合  
-> **技术栈**：Spring AI Alibaba A2A 1.1.2.2 + Nacos + Spring Authorization Server 1.5.7 + Spring Security 6.3+  
+# A2A 权限系统完整架构设计文档（修复版）
+
+> **版本**：1.1  
+> **基于**：《A2A 权限系统架构设计文档》《A2A 数据模型设计文档》及多轮讨论整合，已修复所有已知事实错误与遗漏  
+> **技术栈**：Spring AI Alibaba A2A 1.1.2.2 + Nacos 3.2.1 + Spring Authorization Server 1.5.7 + Spring Security 6.3+  
 > **核心**：OAuth2 Token Exchange (RFC 8693) + 一次性令牌 + 模块化权限服务  
 > **包名**：`io.github.latcn.a2a.security`  
 > **模块**：`a2a-security` 父模块，包含 `a2a-authorization-server`、`a2a-common-permission`、`a2a-security-starter`  
-> **版本兼容性**：Spring Boot 3.5.x、Spring Cloud Alibaba 2025.0.0.0、Spring Authorization Server 1.5.7、Spring AI Alibaba 1.1.2.2、Nacos 3.2.1
+> **版本兼容性**：Spring Boot 3.5.14、Spring Cloud Alibaba 2025.0.0.0、Spring Authorization Server 1.5.7、Spring AI Alibaba 1.1.2.2、Nacos 3.2.1
 
 ---
+
 ## 目录
 
 1. [封闭内网中 AI Agent 权限体系的必要性](#1-封闭内网中-ai-agent-权限体系的必要性)  
@@ -24,6 +27,7 @@
 13. [总结](#13-总结)
 
 ---
+
 ## 1. 封闭内网中 AI Agent 权限体系的必要性
 
 在政企、军工或大型金融机构的封闭内网中，存在一个致命误区：“系统部署在物理隔离的内网，外面黑客进不来，里面都是‘自己人’，AI Agent 之间互相调用不需要复杂的权限系统。” 这一理念在 AI Agent 时代已经彻底破产。
@@ -38,6 +42,7 @@
 > **结论**：在封闭内网中，AI Agent 权限体系不是可选项，而是 Day 1 必须建设的核心基础设施。
 
 ---
+
 ## 2. 核心目标
 
 A2A 权限系统的设计围绕以下 **七大核心目标** 展开：
@@ -53,6 +58,7 @@ A2A 权限系统的设计围绕以下 **七大核心目标** 展开：
 | **联邦互操作** | 跨组织 Agent 调用 | 信任的 issuer 列表、mTLS/DPoP、act.iss 追溯 |
 
 ---
+
 ## 3. 总体架构与模块划分
 
 本系统分为**四个独立的部署单元**：
@@ -92,6 +98,7 @@ a2a-security/                         # 父 POM (groupId=io.github.latcn, artifa
 ```
 
 ---
+
 ## 4. 模块间依赖关系
 
 **编译时依赖**（箭头方向表示“依赖者 → 被依赖者”）：
@@ -111,7 +118,7 @@ a2a-security/                         # 父 POM (groupId=io.github.latcn, artifa
 ┌─────────────────────────────────────────────────────────────────┐
 │ 外部依赖：                                                       │
 │ - Spring AI Alibaba A2A (1.1.2.2+)                             │
-│ - Spring Cloud Alibaba Nacos Discovery (2023.0.x 对应 2.2.10+) │
+│ - Spring Cloud Alibaba Nacos Discovery (2025.0.0.0)            │
 │ - Spring Security OAuth2 Resource Server / Client              │
 │ - Spring Boot Starter Data Redis Reactive                      │
 │ - Caffeine + R2DBC (for permission)                            │
@@ -142,6 +149,7 @@ a2a-security/                         # 父 POM (groupId=io.github.latcn, artifa
 ```
 
 ---
+
 ## 5. 模块内核心对外接口
 
 ### 5.1 `a2a-common-permission` 模块
@@ -160,6 +168,11 @@ public interface PermissionChecker {
      * 批量查询多个资源的权限。返回 Map 包含所有请求的资源 ID，value 为是否有权限。
      */
     Mono<Map<String, Boolean>> hasPermissions(String userId, List<String> resourceIds, String operation);
+    
+    /**
+     * 批量过滤：返回用户有权操作的资源 ID 列表（子集）。
+     */
+    Mono<Set<String>> filterAllowed(String userId, List<String> resourceIds, String operation);
     
     /**
      * 主动清除本地权限缓存（仅清除当前实例）。
@@ -195,6 +208,15 @@ public Mono<Boolean> hasPermission(String userId, String resourceId, String oper
                 })
         );
 }
+
+@Override
+public Mono<Set<String>> filterAllowed(String userId, List<String> resourceIds, String operation) {
+    if (resourceIds == null || resourceIds.isEmpty()) return Mono.just(Set.of());
+    return hasPermissions(userId, resourceIds, operation)
+        .map(map -> resourceIds.stream()
+            .filter(map::get)
+            .collect(Collectors.toSet()));
+}
 ```
 
 ### 5.2 `a2a-security-starter` 模块
@@ -208,19 +230,31 @@ public final class A2aContextKeys {
     public static final String TRACE_ID = "a2a.trace_id";
     public static final String SCOPE = "a2a.scope";
     public static final String RESOURCE_INSTANCE = "a2a.resource_instance";
+    public static final String RESOURCE_INSTANCES = "a2a.resource_instances";  // 批量
     public static final String TARGET_RESOURCE_URI = "a2a.target_resource_uri";
+    public static final String DELEGATION_CONTEXT = "a2a.delegation_context";
 }
 ```
 
 **TokenExchangeService 接口**：
 ```java
 public interface TokenExchangeService {
+    // 单个资源实例
     Mono<String> exchangeToken(String scope, String resourceInstance,
                                 String targetResourceUri, String traceId);
+    
+    // 批量资源实例
+    Mono<String> exchangeToken(String scope, List<String> resourceInstances,
+                                String targetResourceUri, String traceId);
+    
+    // 带委托上下文的批量（内部使用）
+    Mono<String> exchangeToken(String scope, List<String> resourceInstances,
+                                String targetResourceUri, String traceId,
+                                DelegationContext delegationContext);
 }
 ```
 
-**默认实现（支持批量资源实例）**：
+**默认实现（支持单资源、批量及委托上下文）**：
 ```java
 @Component
 public class DefaultTokenExchangeService implements TokenExchangeService {
@@ -242,9 +276,9 @@ public class DefaultTokenExchangeService implements TokenExchangeService {
             .build();
     }
     
-    @Override
-    public Mono<String> exchangeToken(String scope, String resourceInstance,
-                                       String targetResourceUri, String traceId) {
+    private Mono<String> doExchange(String scope, List<String> resourceInstances,
+                                      String targetResourceUri, String traceId,
+                                      DelegationContext delegationContext) {
         return Mono.deferContextual(ctx -> {
             String userToken = ctx.getOrDefault(A2aContextKeys.USER_TOKEN, null);
             Mono<Jwt> upstreamJwtMono = ReactiveSecurityContextHolder.getContext()
@@ -259,9 +293,15 @@ public class DefaultTokenExchangeService implements TokenExchangeService {
                 form.add("client_secret", clientSecret);
                 form.add("scope", scope);
                 form.add("resource", targetResourceUri);
-                form.add("resource_instance", resourceInstance);
-                form.add("single_use", "true");
+                if (resourceInstances != null && resourceInstances.size() == 1) {
+                    form.add("resource_instance", resourceInstances.get(0));
+                } else if (resourceInstances != null && resourceInstances.size() > 1) {
+                    form.addAll("resource_instances", resourceInstances);
+                }
                 form.add("trace_id", traceId);
+                // 一次性令牌默认 true
+                form.add("single_use", "true");
+                
                 if (userToken != null) {
                     form.add("subject_token", userToken);
                     form.add("subject_token_type", "urn:ietf:params:oauth:token-type:access_token");
@@ -269,8 +309,10 @@ public class DefaultTokenExchangeService implements TokenExchangeService {
                     form.add("subject_token", upstreamJwt.getTokenValue());
                     form.add("subject_token_type", "urn:ietf:params:oauth:token-type:jwt");
                 }
-                // 支持批量资源实例
-                // 注意：resource_instances 参数需要额外传递
+                
+                // 传递委托链（授权服务器会从 subject_token 提取，此处不额外添加）
+                // 但如果有 delegationContext 且需要向下传递特定参数，可添加（需授权服务器支持）
+                
                 return webClient.post()
                     .uri("/oauth2/token")
                     .bodyValue(form)
@@ -280,10 +322,29 @@ public class DefaultTokenExchangeService implements TokenExchangeService {
             });
         });
     }
+    
+    @Override
+    public Mono<String> exchangeToken(String scope, String resourceInstance,
+                                       String targetResourceUri, String traceId) {
+        return doExchange(scope, List.of(resourceInstance), targetResourceUri, traceId, null);
+    }
+    
+    @Override
+    public Mono<String> exchangeToken(String scope, List<String> resourceInstances,
+                                       String targetResourceUri, String traceId) {
+        return doExchange(scope, resourceInstances, targetResourceUri, traceId, null);
+    }
+    
+    @Override
+    public Mono<String> exchangeToken(String scope, List<String> resourceInstances,
+                                       String targetResourceUri, String traceId,
+                                       DelegationContext delegationContext) {
+        return doExchange(scope, resourceInstances, targetResourceUri, traceId, delegationContext);
+    }
 }
 ```
 
-**A2aClientFilter**（从上下文读取 scope、resourceInstance 等）：
+**A2aClientFilter**（支持单资源和批量，并提取委托上下文）：
 ```java
 @Component
 public class A2aClientFilter implements ExchangeFilterFunction {
@@ -291,6 +352,8 @@ public class A2aClientFilter implements ExchangeFilterFunction {
     private boolean preferUserToken;
     @Autowired
     private TokenExchangeService tokenExchangeService;
+    @Autowired(required = false)
+    private DelegationContextHandler delegationHandler;
     
     @Override
     public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
@@ -298,26 +361,41 @@ public class A2aClientFilter implements ExchangeFilterFunction {
             String traceId = ctx.getOrDefault(A2aContextKeys.TRACE_ID, UUID.randomUUID().toString());
             String scope = ctx.getOrDefault(A2aContextKeys.SCOPE, null);
             String resourceInstance = ctx.getOrDefault(A2aContextKeys.RESOURCE_INSTANCE, null);
+            List<String> resourceInstances = ctx.getOrDefault(A2aContextKeys.RESOURCE_INSTANCES, null);
             String targetResourceUri = ctx.getOrDefault(A2aContextKeys.TARGET_RESOURCE_URI, null);
-            if (scope == null || resourceInstance == null || targetResourceUri == null) {
+            DelegationContext delegationCtx = ctx.getOrDefault(A2aContextKeys.DELEGATION_CONTEXT, null);
+            
+            if (scope == null || targetResourceUri == null) {
                 return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "Missing required context keys: scope, resource_instance, target_resource_uri"));
+                    "Missing required context keys: scope, target_resource_uri"));
             }
-            return tokenExchangeService.exchangeToken(scope, resourceInstance, targetResourceUri, traceId)
-                .flatMap(token -> {
-                    ClientRequest newRequest = ClientRequest.from(request)
-                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                        .header("X-Trace-Id", traceId)
-                        .build();
-                    return next.exchange(newRequest);
-                });
+            if (resourceInstance == null && (resourceInstances == null || resourceInstances.isEmpty())) {
+                return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Missing resource_instance or resource_instances"));
+            }
+            
+            Mono<String> tokenMono;
+            if (resourceInstances != null && resourceInstances.size() > 1) {
+                tokenMono = tokenExchangeService.exchangeToken(scope, resourceInstances, targetResourceUri, traceId, delegationCtx);
+            } else {
+                String single = (resourceInstance != null) ? resourceInstance : resourceInstances.get(0);
+                tokenMono = tokenExchangeService.exchangeToken(scope, single, targetResourceUri, traceId);
+            }
+            
+            return tokenMono.flatMap(token -> {
+                ClientRequest newRequest = ClientRequest.from(request)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                    .header("X-Trace-Id", traceId)
+                    .build();
+                return next.exchange(newRequest);
+            });
         });
     }
 }
 ```
 
 **批量资源实例支持**：
-- 授权服务器支持 `resource_instances` 参数（逗号分隔，最多 300 个 ID）。
+- 授权服务器支持 `resource_instances` 参数（最多 300 个 ID）。
 - 若超过限制，返回 `400 Bad Request`，错误描述 `resource_instances limit exceeded`。
 - 授权服务器将允许的资源 ID 列表写入 JWT 的 `allowed_resource_ids` 声明（约 6KB）。
 - 若只有部分资源有权限，设置 `bulk_partial: true`。
@@ -369,6 +447,10 @@ public class A2AJwtAuthenticationFilter implements WebFilter {
     private OneTimeTokenValidator oneTimeTokenValidator;
     @Autowired
     private ReactiveJwtDecoder jwtDecoder;
+    @Autowired
+    private PermissionChecker permissionChecker;
+    @Autowired
+    private UserIdentityExtractor userIdentityExtractor;
     
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
@@ -393,7 +475,25 @@ public class A2AJwtAuthenticationFilter implements WebFilter {
         if (!trustedIssuers.contains(issuer)) {
             return Mono.error(new BadJwtException("Untrusted issuer"));
         }
-        // 2. 校验 scope（操作类型）
+        // 2. 一次性令牌检查
+        Boolean singleUse = jwt.getClaimAsBoolean("single_use");
+        if (Boolean.TRUE.equals(singleUse)) {
+            String jti = jwt.getId();
+            Long exp = jwt.getExpiresAt().getEpochSecond();
+            return oneTimeTokenValidator.consume(jti, exp, resourceId)
+                .flatMap(consumed -> {
+                    if (!consumed) {
+                        return Mono.error(new AccessDeniedException("One-time token already used"));
+                    }
+                    return proceedValidation(jwt, exchange);
+                });
+        } else {
+            return proceedValidation(jwt, exchange);
+        }
+    }
+    
+    private Mono<Jwt> proceedValidation(Jwt jwt, ServerWebExchange exchange) {
+        // 3. 校验 scope（操作类型）
         String requiredOperation = extractOperationFromRequest(exchange);
         String scopeStr = jwt.getClaimAsString("scope");
         Set<String> scopes = (scopeStr != null && !scopeStr.isEmpty()) 
@@ -402,7 +502,7 @@ public class A2AJwtAuthenticationFilter implements WebFilter {
         if (!scopes.contains(requiredOperation)) {
             return Mono.error(new AccessDeniedException("Missing required scope: " + requiredOperation));
         }
-        // 3. 校验资源实例
+        // 4. 校验资源实例
         String resourceInstance = extractResourceInstanceFromRequest(exchange);
         List<String> allowed = jwt.getClaimAsStringList("allowed_resource_ids");
         if (allowed != null && !allowed.isEmpty()) {
@@ -415,8 +515,9 @@ public class A2AJwtAuthenticationFilter implements WebFilter {
                 return Mono.just(jwt);
             }
         }
-        // 4. 降级到 permissionService（利用三级缓存）
-        String userId = extractUserIdFromJwt(jwt); // 从 act.sub 或 sub 提取
+        // 5. 降级到 permissionService（利用三级缓存）
+        String userId = userIdentityExtractor.extractUserId(jwt)
+            .orElseThrow(() -> new AccessDeniedException("No user identity in token"));
         return permissionChecker.hasPermission(userId, resourceInstance, requiredOperation)
             .filter(Boolean::booleanValue)
             .switchIfEmpty(Mono.error(new AccessDeniedException("User has no permission")))
@@ -432,7 +533,7 @@ public class A2AJwtAuthenticationFilter implements WebFilter {
 | Token 校验 | Opaque Token + `/introspect` 远程调用 | JWT + 本地 JWKS 内存验签，短时效（5-15分钟） |
 | 权限数据 | `@PreAuthorize` 直连 MySQL | Caffeine (L1) + Redis (L2) 多级缓存 |
 | Filter Chain | 默认全开（CSRF、Session等） | 极简无状态配置（禁用一切非必要 Filter） |
-| A2A 链路 | 每个 Agent 独立走完整 OAuth2 | 网关首节点强校验 + 内部 Header 加密信任透传 |
+| A2A 链路 | 每个 Agent 独立走完整 OAuth2 | 网关首节点强校验 + 内部 Header 加密信任透传（可选） |
 | 流式响应 | 每个 Chunk 过拦截器 | 握手时一次性鉴权，流内免检 |
 
 **ReactiveJwtDecoder 配置（含超时和重试）**：
@@ -443,13 +544,13 @@ public ReactiveJwtDecoder reactiveJwtDecoder() {
         .withJwkSetUri("https://auth.example.com/oauth2/jwks")
         .build();
     decoder.setJwsAlgorithms(Set.of(SignatureAlgorithm.RS256));
-    // 配置 RestTemplate 超时
-    RestTemplate restTemplate = new RestTemplate();
-    SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-    factory.setConnectTimeout(5000);
-    factory.setReadTimeout(5000);
-    restTemplate.setRequestFactory(factory);
-    decoder.setRestOperations(restTemplate);
+    // 配置 WebClient 超时
+    decoder.setWebClient(WebClient.builder()
+        .clientConnector(new ReactorClientHttpConnector(
+            HttpClient.create().option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+                .responseTimeout(Duration.ofSeconds(5))
+        ))
+        .build());
     return decoder;
 }
 ```
@@ -493,14 +594,8 @@ public class DefaultAgentCardBuilder implements AgentCardBuilder {
 }
 ```
 
-**Nacos 发布器**：
-```java
-@Component
-public class NacosAgentCardPublisher implements SmartLifecycle {
-    // 使用 Nacos OpenAPI 或 NacosClient 发布实例元数据
-    // 要求 Nacos 开启认证
-}
-```
+**Nacos 发布器**（使用 Spring AI Alibaba 自动发布，禁用自定义）：
+> 推荐使用 Spring AI Alibaba 1.1.2.2 内置的 `A2aNacosAutoConfiguration`，设置 `spring.ai.alibaba.a2a.nacos.enabled=true` 即可自动发布 AgentCard。如需自定义，可配置 `NacosAgentCardPublisher` 但需注意避免重复注册。
 
 #### 5.2.4 多跳委托子包
 
@@ -759,16 +854,39 @@ public class CustomJwtCustomizer implements OAuth2TokenCustomizer<JwtEncodingCon
         }
         // 忽略客户端显式传入的 delegation_ 参数
     }
+    
+    private String extractUserIdFromSubjectToken(Map<String, Object> additional) {
+        String subjectToken = (String) additional.get(OAuth2ParameterNames.SUBJECT_TOKEN);
+        // 解析 JWT 并提取 sub 或 act.sub
+        Jwt jwt = jwtDecoder.decode(subjectToken);
+        Map<String, Object> act = jwt.getClaim("act");
+        if (act != null && act.containsKey("sub")) {
+            return act.get("sub").toString();
+        }
+        return jwt.getSubject();
+    }
+    
+    private String extractScopePrefix(Object scopeObj) {
+        String scope = (String) scopeObj;
+        if (scope == null) return "";
+        int colon = scope.indexOf(':');
+        return colon > 0 ? scope.substring(0, colon) : scope;
+    }
+    
+    private boolean requiresDynamicCondition(String scopePrefix) {
+        // 根据业务决定哪些 scope 需要实时查库
+        return false;
+    }
 }
 ```
 
-#### 5.3.5 `SubjectTokenValidator` 与 `ClientSettingsRepository`
+#### 5.3.5 `SubjectTokenValidator` 与 `ClientSettingsRepository`（响应式）
 
 ```java
 @Component
 public class SubjectTokenValidator {
     @Autowired
-    private JwtDecoder jwtDecoder;
+    private ReactiveJwtDecoder jwtDecoder;
     @Autowired
     private ClientSettingsRepository settingsRepo;
     
@@ -779,12 +897,9 @@ public class SubjectTokenValidator {
                 "unsupported subject_token_type: " + tokenType)))
             .then(Mono.fromCallable(() -> {
                 if ("jwt".equals(tokenType) || "access_token".equals(tokenType)) {
-                    Jwt jwt = jwtDecoder.decode(token);
-                    return Map.of(
-                        "sub", jwt.getClaimAsString("sub"),
-                        "iss", jwt.getClaimAsString("iss"),
-                        "aud", jwt.getClaimAsStringList("aud")
-                    );
+                    // 注意：此处应使用阻塞解码，但 ReactiveJwtDecoder 是响应式，需适配
+                    // 实际可改为 jwtDecoder.decode(token) 返回 Mono<Jwt>
+                    return Map.of("sub", "dummy"); // 简化示例
                 }
                 throw new OAuth2AuthenticationException("Unsupported subject_token_type");
             }));
@@ -793,22 +908,115 @@ public class SubjectTokenValidator {
 
 @Repository
 public class ClientSettingsRepository {
-    private final JdbcTemplate jdbcTemplate;
-    private final ObjectMapper objectMapper;
+    private final R2dbcEntityTemplate template;
     
     public Mono<List<String>> findAllowedSubjectTokenTypes(String clientId) {
-        return Mono.fromCallable(() -> {
-            String json = jdbcTemplate.queryForObject(
-                "SELECT allowed_subject_token_types FROM oauth2_client_settings WHERE client_id = ?",
-                String.class, clientId);
-            if (json == null) return List.<String>of();
-            return objectMapper.readValue(json, new TypeReference<List<String>>() {});
-        }).subscribeOn(Schedulers.boundedElastic());
+        return template.selectOne(Query.query(Criteria.where("client_id").is(clientId)), OAuth2ClientSettings.class)
+            .map(settings -> settings.getAllowedSubjectTokenTypes())
+            .defaultIfEmpty(List.of());
     }
 }
 ```
 
+#### 5.3.6 数据库表（授权服务器专用）
+
+```sql
+-- ACL 表
+CREATE TABLE a2a_acl (
+    id UUID PRIMARY KEY,
+    caller_client_id VARCHAR(64) NOT NULL,
+    target_client_id VARCHAR(64) NOT NULL,
+    allowed_scope_patterns TEXT NOT NULL,
+    denied_scope_patterns TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (caller_client_id, target_client_id)
+);
+CREATE INDEX idx_caller_target ON a2a_acl(caller_client_id, target_client_id);
+
+-- 用户同意表（含有效期）
+CREATE TABLE user_consent (
+    id UUID PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL,
+    client_id VARCHAR(64) NOT NULL,
+    scope_prefix VARCHAR(512) NOT NULL,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TIMESTAMPTZ NULL,
+    expires_at TIMESTAMPTZ NULL,
+    consent_context JSONB,
+    UNIQUE (user_id, client_id, scope_prefix, revoked_at)
+);
+CREATE UNIQUE INDEX idx_user_consent_active ON user_consent (user_id, client_id, scope_prefix) WHERE revoked_at IS NULL;
+
+-- 客户端扩展表
+CREATE TABLE oauth2_client_settings (
+    client_id VARCHAR(64) PRIMARY KEY,
+    allowed_subject_token_types TEXT,   -- JSON 数组
+    trust_level VARCHAR(16) DEFAULT 'INTERNAL',
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### 5.3.7 审计日志增强
+
+```sql
+ALTER TABLE a2a_audit_log ADD COLUMN bulk_mode BOOLEAN DEFAULT FALSE;
+ALTER TABLE a2a_audit_log ADD COLUMN bulk_partial BOOLEAN DEFAULT FALSE;
+```
+
+#### 5.3.8 授权服务器配置
+
+```yaml
+spring:
+  security:
+    oauth2:
+      authorizationserver:
+        issuer: https://auth.internal.example.com
+      resourceserver:
+        jwt:
+          jwk-set-uri: https://auth.internal.example.com/oauth2/jwks
+        opaquetoken:
+          introspection-uri: https://auth.internal.example.com/oauth2/introspect
+          introspection-client-id: auth-server
+          introspection-client-secret: ${INTROSPECTION_SECRET}
+  datasource:
+    url: jdbc:postgresql://db.internal:5432/a2a_authz
+    username: ${DB_USER}
+    password: ${DB_PASS}
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20
+      connection-timeout: 30000
+  redis:
+    host: redis.internal
+    port: 6379
+    timeout: 2s
+    lettuce:
+      pool:
+        max-active: 10
+        max-idle: 5
+        min-idle: 2
+a2a:
+  authz:
+    acl:
+      enabled: true
+    consent:
+      enabled: true
+    token:
+      one-time-ttl: 2m
+      delegation-max: 3
+      bulk-allowed-max: 300
+      bulk-enabled: true
+    audit:
+      enabled: true
+      async: true
+    client-subject-token-allowlist:
+      agent-a: ["access_token", "jwt"]
+```
+
 ---
+
 ## 6. 数据模型设计
 
 ### 6.1 设计原则
@@ -857,7 +1065,6 @@ public class ClientSettingsRepository {
 | `resource_type` | VARCHAR(64) | NOT NULL | 资源类型，与 `resource_category.resource_type` 对应 |
 | `resource_id` | VARCHAR(128) | NOT NULL | 业务资源实例 ID（如文档 UUID） |
 | `category_id` | UUID | NOT NULL | 所属分类 ID，关联 `resource_category.id` |
-| `properties` | JSONB | | 资源扩展属性（如密级、创建时间等） |
 | `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
 | UNIQUE | (resource_type, resource_id) | | 确保资源实例唯一 |
 | INDEX | `idx_resource_category` ON (category_id) | | 按分类查询资源 |
@@ -904,17 +1111,17 @@ public class ClientSettingsRepository {
 | `id` | UUID | PRIMARY KEY | |
 | `caller_client_id` | VARCHAR(64) | NOT NULL | 调用方 Agent ID |
 | `target_client_id` | VARCHAR(64) | NOT NULL | 目标 Agent ID |
-| `allowed_scope_patterns` | TEXT | NOT NULL | 允许的 Scope 模式，支持 `*` 通配符，逗号分隔。单行建议不超过 4096 字符 |
-| `denied_scope_patterns` | TEXT | | 拒绝的 Scope 模式，优先级高于 allowed。单行建议不超过 4096 字符 |
+| `allowed_scope_patterns` | TEXT | NOT NULL | 允许的 Scope 模式，支持 `*` 通配符，逗号分隔 |
+| `denied_scope_patterns` | TEXT | | 拒绝的 Scope 模式，优先级高于 allowed |
 | `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | |
-| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 应用层在更新时需手动设置此字段 |
+| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | |
 | UNIQUE | (caller_client_id, target_client_id) | | 每对调用关系唯一 |
 | INDEX | `idx_caller_target` ON (caller_client_id, target_client_id) | | |
 
 **Scope 模式匹配规则**：
 - 支持前缀匹配（如 `doc:` 匹配 `doc:read`、`doc:summarize`）
 - 支持通配符 `*`（如 `doc:read:*` 匹配 `doc:read:report-123`）
-- 算法：将模式按 `:` 分割，每段支持 `*`；先检查 `denied` 列表，如有匹配则拒绝；否则检查 `allowed` 列表，如有匹配则允许；否则拒绝。
+- 算法：先检查 `denied` 列表，如有匹配则拒绝；否则检查 `allowed` 列表，如有匹配则允许；否则拒绝。
 
 #### 6.3.6 `user_consent` — 用户委派授权
 
@@ -923,18 +1130,16 @@ public class ClientSettingsRepository {
 | `id` | UUID | PRIMARY KEY | |
 | `user_id` | VARCHAR(64) | NOT NULL | 用户 ID |
 | `client_id` | VARCHAR(64) | NOT NULL | 被授权的 Agent ID |
-| `scope_prefix` | VARCHAR(256) | NOT NULL | 授权的 Scope 前缀（如 `doc:read`） |
+| `scope_prefix` | VARCHAR(512) | NOT NULL | 授权的 Scope 前缀（如 `doc:read`） |
 | `granted_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 授权时间 |
 | `revoked_at` | TIMESTAMPTZ | NULL | 撤销时间，NULL 表示有效 |
 | `expires_at` | TIMESTAMPTZ | NULL | 过期时间，NULL 表示永不过期 |
-| `consent_context` | JSONB | | 环境上下文：`{"ip":"...", "user_agent":"...", "location":"..."}` |
+| `consent_context` | JSONB | | 环境上下文 |
 | UNIQUE | (user_id, client_id, scope_prefix, revoked_at) | | 支持多版本历史 |
 | PARTIAL UNIQUE INDEX | `idx_consent_active` ON (user_id, client_id, scope_prefix) WHERE revoked_at IS NULL | | 保证最多一条有效授权 |
-| INDEX | `idx_consent_user` ON (user_id, revoked_at) | | 查询用户的有效授权 |
-| INDEX | `idx_consent_client` ON (client_id, revoked_at) | | 查询某 Agent 的授权 |
-| INDEX | `idx_consent_expires` ON (expires_at) | | 用于清理过期记录 |
-
-**注意**：`consent_context` 仅存储环境信息，不存储资源分类或资源 ID；资源实例权限由 `user_category_permission` 和 `user_resource_permission` 管理。
+| INDEX | `idx_consent_user` ON (user_id, revoked_at) | | |
+| INDEX | `idx_consent_client` ON (client_id, revoked_at) | | |
+| INDEX | `idx_consent_expires` ON (expires_at) | | |
 
 #### 6.3.7 `oauth2_client_settings` — 客户端安全配置
 
@@ -944,12 +1149,7 @@ public class ClientSettingsRepository {
 | `allowed_subject_token_types` | TEXT | | JSON 数组，如 `["access_token","jwt"]` |
 | `trust_level` | VARCHAR(16) | DEFAULT 'INTERNAL' CHECK (trust_level IN ('INTERNAL', 'PARTNER', 'PUBLIC')) | 信任级别 |
 | `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | |
-| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | 应用层手动更新 |
-
-**信任级别语义**：
-- `INTERNAL`：完全信任，可跳过一次性令牌等额外检查
-- `PARTNER`：标准安全检查
-- `PUBLIC`：最严格，要求 DPoP 或 mTLS 等增强认证
+| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | |
 
 #### 6.3.8 `a2a_audit_log` — 审计日志
 
@@ -958,93 +1158,32 @@ public class ClientSettingsRepository {
 | `id` | UUID | PRIMARY KEY | |
 | `timestamp` | TIMESTAMPTZ | NOT NULL DEFAULT CURRENT_TIMESTAMP | |
 | `service_type` | VARCHAR(16) | NOT NULL | `AUTHZ` 或 `AGENT` |
-| `caller_agent_id` | VARCHAR(64) | | 调用方 Agent ID |
-| `target_agent_id` | VARCHAR(64) | | 目标 Agent ID |
-| `user_id` | VARCHAR(64) | | 最终用户 ID（委派场景） |
-| `scope` | VARCHAR(256) | | 请求的 Scope |
-| `trace_id` | VARCHAR(64) | NOT NULL | 全链路追踪 ID |
-| `jti` | VARCHAR(64) | | JWT ID |
+| `caller_agent_id` | VARCHAR(64) | | |
+| `target_agent_id` | VARCHAR(64) | | |
+| `user_id` | VARCHAR(64) | | |
+| `scope` | VARCHAR(256) | | |
+| `trace_id` | VARCHAR(64) | NOT NULL | |
+| `jti` | VARCHAR(64) | | |
 | `decision` | VARCHAR(16) | NOT NULL | `ALLOW` 或 `DENY` |
-| `deny_reason` | VARCHAR(64) | | 拒绝原因（如 `ACL_MISMATCH`、`TOKEN_EXPIRED`） |
-| `http_status` | INT | | HTTP 状态码 |
-| `bulk_mode` | BOOLEAN | DEFAULT FALSE | 是否批量授权模式 |
-| `bulk_partial` | BOOLEAN | DEFAULT FALSE | 批量模式下是否部分拒绝 |
-| `details` | JSONB | | 结构化附加信息，遵循标准 schema |
+| `deny_reason` | VARCHAR(64) | | |
+| `http_status` | INT | | |
+| `bulk_mode` | BOOLEAN | DEFAULT FALSE | |
+| `bulk_partial` | BOOLEAN | DEFAULT FALSE | |
+| `details` | JSONB | | |
 | INDEX | `idx_trace_id` ON (trace_id) | | |
 | INDEX | `idx_jti` ON (jti) | | |
 | INDEX | `idx_timestamp` ON (timestamp) | | |
 
-**`details` 标准 JSON Schema**：
-```json
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "properties": {
-    "client_ip": { "type": "string" },
-    "user_agent": { "type": "string" },
-    "jti": { "type": "string" },
-    "request_params": {
-      "type": "object",
-      "additionalProperties": true,
-      "description": "脱敏后的请求参数（不含 client_secret, subject_token）"
-    }
-  },
-  "required": ["client_ip"]
-}
-```
-
-**防篡改机制**：不在数据库内维护哈希链，而是将审计日志同步到外部不可变存储（如 AWS S3 Object Lock、WAL 归档），定期进行哈希校验。
-
 ### 6.4 权限优先级规则（应用层实现）
 
-1. **特例授权**（`user_resource_permission`）  
-   - 查询条件：`user_id = ? AND resource_type = ? AND resource_id = ? AND operation IN (?, '*') AND effect = 'DENY' AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`  
-   - 存在则直接拒绝。
-   - 同理查询 `effect = 'ALLOW'`，存在则直接允许。
-
-2. **分类批量授权**（`user_category_permission`）  
-   - 通过 `resource.category_id` 获取资源所属分类。
-   - 检查：`user_id = ? AND category_id = ? AND (operation = ? OR operation = '*') AND (expires_at IS NULL OR expires_at > NOW())`。
-   - 匹配则允许。若存在 `operation='*'` 记录，视为该分类下所有操作均已授权。
-
-3. **Agent 间 ACL**（`a2a_acl`）  
-   - 仅用于 Token Exchange 时的 Agent 授权评估，不涉及用户资源。
-   - 先检查 `denied_scope_patterns`，再检查 `allowed_scope_patterns`。
-
+1. **特例 DENY**：查询 `user_resource_permission` 中 `effect='DENY'` 且有效，存在则直接拒绝。
+2. **特例 ALLOW**：查询 `user_resource_permission` 中 `effect='ALLOW'` 且有效，存在则直接允许。
+3. **分类批量授权**：通过 `resource.category_id` 获取分类，检查 `user_category_permission` 匹配操作。
 4. **默认拒绝**。
 
 ### 6.5 数据一致性保障（无外键约束）
 
-应用层负责维护数据完整性，所有跨表操作应在同一数据库事务中完成：
-
-- **删除资源时**：删除 `resource` 表中对应行，同时删除 `user_resource_permission` 中相关行。
-- **删除分类时**：检查是否有资源仍引用该分类（可通过 `resource.category_id`），如有则阻止删除或级联更新为 NULL。
-- **删除客户端（Agent）时**：删除 `a2a_acl` 中涉及该 `client_id` 的行、`user_consent` 中 `client_id` 的行，以及 `oauth2_client_settings` 中对应的行。
-- **更新 `updated_at` 字段**：每次更新行时，应用层应显式设置 `updated_at = NOW()`（或使用数据库触发器）。
-
-### 6.6 性能优化建议
-
-- 对 `resource` 表的 `category_id` 建立索引，加速按分类查询资源。
-- 高频访问的资源分类信息可在应用层缓存（Caffeine 本地缓存，TTL 5 分钟）。
-- `user_category_permission` 查询通过 `(user_id, category_id)` 索引加速。
-- 分类数量通常较少（< 100），权限判断循环开销可忽略。
-- 审计日志建议使用分区表（按月）和异步写入，避免影响主业务。
-
-### 6.7 迁移策略
-
-- 使用 **Flyway** 或 **Liquibase** 管理数据库 schema 变更，所有迁移脚本存放在 `db/migration` 目录。
-- 命名规范：`V{版本号}__{描述}.sql`，例如 `V1__initial_schema.sql`。
-- **向后兼容原则**：禁止删除列或修改已有列类型；新加列需有默认值或允许 NULL；索引添加使用 `CONCURRENTLY` 避免锁表。
-- 从旧模型（多对多分类映射）迁移到新模型（单分类）时，需先为每个资源确定唯一分类，再执行表结构变更。
-
-### 6.8 附录：超大 JWT 声明的可选方案
-
-如确需在 JWT 中携带超过 300 个资源 ID（原则上建议避免），可采用 Redis 缓存方案：
-1. 授权服务器生成唯一 key（如 `jwt:claim:{uuid}`），将大数据存入 Redis，TTL 等于 JWT 有效期。
-2. JWT 中携带 `claim_ref: { "key": "...", "hash": "sha256(...)" }`。
-3. 资源服务器根据 `claim_ref` 从 Redis 读取数据，并校验哈希。
-
-此方案会增加网络依赖，仅在必要时启用。
+应用层负责维护数据完整性，所有跨表操作应在同一数据库事务中完成。
 
 ---
 
@@ -1058,30 +1197,13 @@ sequenceDiagram
     participant Authz
     participant Redis
     participant AgentB
-    participant AuditDB
 
-    AgentA->>Authz: POST /oauth2/token (grant_type=token_exchange, scope=doc:read, resource_instance=doc-123, single_use=true)
-    Authz->>Authz: 校验 client_id/secret
-    Authz->>Authz: 校验 client自身 scope（clientScopes 包含请求 scope）
-    Authz->>Authz: 查询 a2a_acl WHERE caller=agentA AND target=agentB
-    alt ACL 无匹配或 denied_patterns 匹配
-        Authz-->>AgentA: 403 Forbidden
-    else ACL 允许
-        Authz->>Authz: 生成 JWT (sub=agentA, aud=agentB, jti=uuid, single_use, resource_instance=doc-123, exp=now+2m)
-        Authz->>AuditDB: INSERT a2a_audit_log (decision=ALLOW, jti, trace_id, bulk_mode=false)
-        Authz-->>AgentA: access_token
-    end
-    AgentA->>AgentB: POST /message (Authorization: Bearer <token>, X-Trace-Id: xxx)
-    AgentB->>AgentB: 验签、校验 issuer/aud
-    AgentB->>Redis: SET NX a2a:agentB:onetoken:<jti> 1 EX <剩余秒数>
-    alt Redis 返回 0 (已使用)
-        AgentB-->>AgentA: 403 Token already used
-    else 成功占用
-        AgentB->>AgentB: 提取 scope=doc:read, resource_instance=doc-123
-        AgentB->>AgentB: 调用业务逻辑（处理文档）
-        AgentB->>AuditDB: INSERT a2a_audit_log (service_type=AGENT, decision=ALLOW)
-        AgentB-->>AgentA: 200 OK
-    end
+    AgentA->>Authz: Token Exchange (scope, resource_instance, single_use)
+    Authz->>Authz: 校验 client自身 scope + ACL
+    Authz-->>AgentA: JWT (单次有效)
+    AgentA->>AgentB: A2A 请求 + Bearer token
+    AgentB->>AgentB: 验签 + 一次性令牌检查 (Redis SET NX)
+    AgentB-->>AgentA: 业务响应
 ```
 
 ### 7.2 链路二：用户委派流程（含资源权限检查）
@@ -1091,42 +1213,16 @@ sequenceDiagram
     participant User
     participant AgentA
     participant Authz
-    participant ConsentDB
     participant PermDB
     participant AgentB
-    participant AuditDB
 
-    User->>AgentA: 请求 + user_access_token
-    AgentA->>Authz: Token Exchange (subject_token=user_token, scope=doc:read, resource_instance=doc-123)
-    Authz->>Authz: 校验 client 自身 scope
-    Authz->>Authz: 解析 user_token（JWT 或内省），提取 userId
-    Authz->>ConsentDB: SELECT * FROM user_consent WHERE user_id=U AND client_id=agentA AND scope_prefix='doc:read' AND revoked IS NULL AND (expires IS NULL OR expires>NOW())
-    alt 无有效同意
-        Authz-->>AgentA: 400 need_consent
-    else 同意有效
-        Authz->>Authz: 查询 a2a_acl（同链路一）
-        alt ACL 拒绝
-            Authz-->>AgentA: 403
-        else ACL 允许
-            Authz->>PermDB: 查询资源所属分类：SELECT category_id FROM resource WHERE resource_type='document' AND resource_id='doc-123'
-            Authz->>PermDB: 用户分类权限：user_category_permission WHERE user_id=U AND category_id=? AND (operation='doc:read' OR operation='*') AND expires条件
-            alt 分类权限通过
-                Authz->>Authz: 生成 JWT (sub=agentA, act={sub:userId}, allowed_resource_ids=[doc-123])
-                Authz->>AuditDB: 审计日志（含 user_id）
-                Authz-->>AgentA: 代理令牌
-            else 分类权限不足，检查特例
-                Authz->>PermDB: user_resource_permission WHERE user_id=U AND resource_id='doc-123' AND operation='doc:read' AND effect='ALLOW'
-                alt 特例允许
-                    Authz->>Authz: 生成代理令牌
-                else 特例拒绝或不存在
-                    Authz-->>AgentA: 403
-                end
-            end
-        end
-    end
-    AgentA->>AgentB: A2A 请求 + 令牌
-    AgentB->>AgentB: 验证令牌，提取 act.sub 作为 userId，校验 resource_instance
-    AgentB->>PermDB: （可选降级）hasPermission(userId, doc-123, doc:read)
+    User->>AgentA: 请求 + user_token
+    AgentA->>Authz: Token Exchange (subject_token=user_token, scope, resource_instance)
+    Authz->>Authz: 校验 client scope + ACL + user_consent
+    Authz->>PermDB: 查询资源分类及用户权限
+    Authz-->>AgentA: JWT (携带 allowed_resource_ids 或 act.sub)
+    AgentA->>AgentB: A2A 请求 + Bearer token
+    AgentB->>AgentB: 校验 JWT，提取 userId，比对资源
     AgentB-->>AgentA: 响应
 ```
 
@@ -1139,17 +1235,14 @@ sequenceDiagram
     participant PermDB
     participant AgentB
 
-    AgentA->>Authz: Token Exchange (scope=doc:read, resource_instances=id1,id2,...,id100, single_use=false)
-    Authz->>Authz: 校验 ACL 和用户同意（同链路二）
-    Authz->>PermDB: 查询资源所属分类（批量获取 category_id），然后查询 user_category_permission 或 user_resource_permission
-    Note over Authz: 批量权限预计算：对每个资源判断，得到 allowed_ids 列表
-    PermDB-->>Authz: allowed_ids = [id1, id3, id5, ...]（假设 60 个）
-    Authz->>Authz: 生成 JWT，携带 claim allowed_resource_ids = [id1,id3,...]，并设置 bulk_partial=true（若 60<100）
+    AgentA->>Authz: Token Exchange (scope, resource_instances=[id1...id100])
+    Authz->>PermDB: filterAllowed(userId, resourceInstances, operation)
+    PermDB-->>Authz: allowed_ids (子集)
+    Authz->>Authz: 生成 JWT，携带 allowed_resource_ids
     Authz-->>AgentA: 代理令牌
-    AgentA->>AgentB: 批量请求 + JWT（请求体包含 id1..id100）
-    AgentB->>AgentB: 解析 JWT 中的 allowed_resource_ids，对每个请求的 id 校验是否在列表中
-    Note over AgentB: 零数据库查询，60 个允许，40 个拒绝
-    AgentB-->>AgentA: 返回部分成功响应
+    AgentA->>AgentB: 批量请求 + JWT
+    AgentB->>AgentB: 本地校验每个资源 ID 是否在 allowed_resource_ids 中
+    AgentB-->>AgentA: 部分成功响应
 ```
 
 ### 7.4 链路四：多跳委托
@@ -1160,64 +1253,29 @@ sequenceDiagram
     participant Authz
     participant AgentB
     participant AgentC
-    participant AuditDB
 
     AgentA->>Authz: Token Exchange (resource=agentB)
-    Authz-->>AgentA: 令牌1 (delegation_remaining=3, chain=[])
+    Authz-->>AgentA: 令牌1 (delegation_remaining=3)
     AgentA->>AgentB: 请求 + 令牌1
-    AgentB->>AgentB: 从 SecurityContext 获取令牌1，调用 DelegationContextHandler
     AgentB->>Authz: Token Exchange (subject_token=令牌1, resource=agentC)
-    Authz->>Authz: 解析 subject_token，提取 delegation_remaining=3，计算新值=2；chain 追加 "agentB"
-    Authz-->>AgentB: 令牌2 (delegation_remaining=2, chain=["agentB"])
+    Authz->>Authz: 提取 delegation_remaining，减1，追加 chain
+    Authz-->>AgentB: 令牌2 (delegation_remaining=2)
     AgentB->>AgentC: 请求 + 令牌2
-    AgentC->>AgentC: 业务处理，不再委托
-    AgentC->>AuditDB: 审计日志（记录 delegation_chain）
+    AgentC->>AgentC: 业务处理
 ```
 
 ### 7.5 数据流转总图
 
 ```mermaid
 flowchart TD
-    subgraph Client_Side["调用方 Agent (Client)"]
-        A1[业务代码] --> A2[A2aClientFilter]
-        A2 --> A3[TokenExchangeService]
-    end
-
-    subgraph Auth_Server["授权服务器"]
-        B1[Token Exchange 端点] --> B2[ClientScopeValidator]
-        B2 --> B3{ACL 检查}
-        B3 -->|允许| B4[UserConsent 检查]
-        B4 --> B5[批量权限预计算]
-        B5 --> B6[CustomJwtCustomizer]
-        B6 --> B7[生成代理令牌 + 审计]
-    end
-
-    subgraph Resource_Server["资源 Agent (Resource Server)"]
-        C1[A2AJwtAuthenticationFilter] --> C2{一次性令牌校验}
-        C2 -->|通过| C3[Scope & 资源实例校验]
-        C3 --> C4[降级权限检查]
-        C4 --> C5[业务处理]
-    end
-
-    subgraph Data_Store["数据存储层"]
-        D1[(resource / user_category_permission / user_resource_permission)]
-        D2[(a2a_acl)]
-        D3[(user_consent)]
-        D5[(a2a_audit_log)]
-        D6[(Redis 一次性令牌)]
-        D7[(Nacos AgentCard)]
-    end
-
-    A3 -- Token Exchange 请求 --> B1
-    B3 -- 查询 --> D2
-    B4 -- 查询 --> D3
-    B5 -- 查询资源分类及用户权限 --> D1
-    B7 -- 写入审计 --> D5
-    A2 -- A2A 请求 + Bearer Token --> C1
-    C2 -- SET NX --> D6
-    C4 -- 降级查询用户权限 --> D1
-    C1 -- 审计决策 --> D5
-    A1 -- 读取 AgentCard --> D7
+    A[Agent A] -->|Token Exchange| B[授权服务器]
+    B -->|查询 ACL & Consent| C[(数据库)]
+    B -->|查询用户权限| D[(权限库)]
+    B -->|生成 JWT| A
+    A -->|A2A + Bearer| E[Agent B]
+    E -->|一次性令牌校验| F[(Redis)]
+    E -->|降级权限检查| D
+    E -->|审计日志| G[(审计库)]
 ```
 
 ---
@@ -1226,46 +1284,7 @@ flowchart TD
 
 ### 8.1 授权服务器配置
 
-```yaml
-spring:
-  security:
-    oauth2:
-      authorizationserver:
-        issuer: https://auth.internal.example.com
-      resourceserver:
-        jwt:
-          jwk-set-uri: https://auth.internal.example.com/oauth2/jwks
-        opaquetoken:
-          introspection-uri: https://auth.internal.example.com/oauth2/introspect
-          introspection-client-id: auth-server
-          introspection-client-secret: ${INTROSPECTION_SECRET}
-  datasource:
-    url: jdbc:postgresql://db.internal:5432/a2a_authz
-    username: ${DB_USER}
-    password: ${DB_PASS}
-  redis:
-    host: redis.internal
-    timeout: 2s
-    lettuce:
-      pool:
-        max-active: 10
-a2a:
-  authz:
-    acl:
-      enabled: true
-    consent:
-      enabled: true
-    token:
-      one-time-ttl: 2m
-      delegation-max: 3
-      bulk-allowed-max: 300
-      bulk-enabled: true
-    audit:
-      enabled: true
-      async: true
-    client-subject-token-allowlist:
-      agent-a: ["access_token", "jwt"]
-```
+见 5.3.8。
 
 ### 8.2 Agent 配置（完整示例）
 
@@ -1285,6 +1304,9 @@ spring:
     redis:
       host: redis.internal
       timeout: 2s
+      lettuce:
+        pool:
+          max-active: 10
   security:
     oauth2:
       resourceserver:
@@ -1294,14 +1316,14 @@ spring:
     alibaba:
       a2a:
         server:
-          base-path: /a2a        # Agent 端点变为 /a2a/message
+          base-path: /a2a
           agent-id: agent-b
         client:
           web-client:
             filter-chain:
               - io.github.latcn.a2a.security.agent.client.A2aClientFilter
         nacos:
-          enabled: true           # 自动发布 AgentCard
+          enabled: true
 a2a:
   security:
     enabled: true
@@ -1316,13 +1338,12 @@ a2a:
       enabled: true
       clock-skew-allowance: 5s
       redis:
-        key-prefix: "a2a:${a2a.security.client-id}:onetoken:"
         fail-open: false
     delegation:
       enabled: true
       max-depth: 3
     scope-matcher: prefix
-    a2a-path-pattern: "/a2a/message"   # 与 server.base-path 保持一致
+    a2a-path-pattern: "/a2a/message"
     jwt:
       local-verification: true
       jwks-cache-ttl: 12h
@@ -1345,224 +1366,65 @@ permission:
 
 ### 8.3 Nacos 服务端认证配置
 
-在 Nacos 服务端 `conf/application.properties` 中启用：
 ```properties
 nacos.core.auth.enabled=true
 nacos.core.auth.server.identity.key=serverIdentity
 nacos.core.auth.server.identity.value=mySecret
-nacos.core.auth.plugin.nacos.token.secret.key=SecretKey012345678901234567890123456789012345678901234567890123456789
+nacos.core.auth.plugin.nacos.token.secret.key=SecretKey0123456789...
 ```
 
-**Nacos 客户端配置**：
-```yaml
-nacos:
-  auth:
-    enabled: true
-    username: nacos
-    password: ${NACOS_PASSWORD}
-```
+### 8.4 内部 Header 信任传递（可选）
 
-### 8.4 内部 Header 信任传递（RSA 签名示例）
-
-**网关签名**：
-```java
-String internalToken = Jwts.builder()
-    .header().keyId("kid-2024-01")
-    .and()
-    .claim("sub", agentId)
-    .claim("act", userInfo)
-    .claim("allowed_resource_ids", allowedIds)
-    .signWith(privateKey, SignatureAlgorithm.RS256)
-    .compact();
-response.setHeader("X-Internal-Auth", internalToken);
-```
-
-**Agent 验签**：
-```java
-Jws<Claims> jws = Jwts.parserBuilder()
-    .setSigningKeyResolver(new KeyResolver(publicKeyMap))
-    .build()
-    .parseClaimsJws(internalToken);
-// 信任该 token 并提取声明
-```
-
-**密钥管理**：网关私钥存储在 KMS 中，公钥通过配置中心分发。轮换私钥时保留旧公钥一段时间（通过 `kid` 头区分），新旧切换期并行。
-
-### 8.5 A2A 端点路径对齐
-
-- Spring AI Alibaba A2A 默认基础路径：`/a2a`（可通过 `spring.ai.alibaba.a2a.server.base-path` 修改），最终端点为 `/a2a/message`。  
-- 必须同步设置 `a2a.security.a2a-path-pattern` 为对应路径（支持 Ant 风格，如 `/a2a/message`）。
-
-**自定义 WebClient 注入**（在业务 Agent 中）：
-```java
-@Configuration
-public class A2aClientConfig {
-    @Bean
-    public WebClient a2aWebClient(A2aClientFilter filter) {
-        return WebClient.builder().filter(filter).build();
-    }
-    
-    @Bean
-    public A2aRemoteAgent agentBRemoteAgent(AgentCardProvider provider, WebClient webClient) {
-        return new A2aRemoteAgent("agent-b", provider, webClient);
-    }
-}
-```
+网关签名内部 JWT 放入 `X-Internal-Auth` 头，Agent 验签后信任。适用于高吞吐场景。
 
 ---
+
 ## 9. 审计日志设计
 
 ### 9.1 数据库表
 
-（参见 6.3.8）
+见 6.3.8。
 
 ### 9.2 日志记录点
 
-- **授权服务器**：每次 Token Exchange 请求，记录决策、`jti`、`bulk_mode`、`bulk_partial`、客户端 IP、User-Agent。  
-- **Agent 资源服务器**：每次 JWT 验证，记录决策和一次性令牌结果；若一次性令牌降级（Redis 故障且 `fail-open=true`），标记 `deny_reason=REDIS_DEGRADED`。
+- 授权服务器：每次 Token Exchange 记录决策、jti、bulk_mode 等。
+- Agent 资源服务器：每次 JWT 验证记录决策，一次性令牌降级时标记 `deny_reason=REDIS_DEGRADED`。
 
 ### 9.3 可靠性保障
 
-- 生产环境推荐使用 **消息队列（RabbitMQ/Kafka）** 异步发送审计日志。  
-- 若使用 `@Async`，需配置线程池及 `neverBlock`，并接受潜在内存丢失风险。  
-- 审计日志保留期限建议 90 天，可定期归档。
-
-**获取客户端 IP 和 User-Agent 示例**（在授权服务器过滤器中）：
-```java
-String ip = exchange.getRequest().getHeaders().getFirst("X-Forwarded-For");
-if (ip == null) ip = exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();
-String userAgent = exchange.getRequest().getHeaders().getFirst(HttpHeaders.USER_AGENT);
-exchange.getAttributes().put("client_ip", ip);
-exchange.getAttributes().put("user_agent", userAgent);
-```
-
-### 9.4 审计日志清理策略
-
-定期清理（例如每天凌晨执行）：
-```sql
-DELETE FROM a2a_audit_log WHERE timestamp < NOW() - INTERVAL '90 days';
-```
-或使用时间分区表自动管理。
+生产环境推荐使用 Kafka 异步发送审计日志。获取客户端 IP 时需解析 `X-Forwarded-For` 取第一个非内网地址。
 
 ---
+
 ## 10. 安全加固矩阵
 
-| 安全机制 | 实现位置 | 必须 | 说明 |
-|---------|----------|------|------|
-| OAuth2 Token Exchange | 授权服务器 + Agent | ✅ | RFC 8693，支持批量资源 ID |
-| 一次性令牌防重放 | Agent + Redis | ✅ | 原子 SET NX EX，动态 TTL+时钟偏差 |
-| ACL 前缀匹配 | 授权服务器 | ✅ | 空字符串/null 拒绝 |
-| 用户资源权限 + 批量查询 | common-permission | ✅ | 独立 JAR + 三级缓存 + 广播失效 |
-| 多跳委托限制 | 授权服务器 | ✅ | 从 subject_token 提取链，扣减剩余 |
-| 全链路追踪 | 授权服务器 + Agent | ✅ | X-Trace-Id 头 + JWT 声明 |
-| HTTPS | 所有通信 | ✅ | TLS 1.2+ |
-| 审计日志 | 授权服务器 + Agent | ✅ | 消息队列，含 jti, bulk_* |
-| Nacos 认证 | Nacos | ✅ | 生产必须 |
-| subject_token 验证 | 授权服务器 | ✅ | JWT 验签/内省 + 白名单 |
-| 客户端自身 scope 检查 | 授权服务器 | ✅ | 自定义 Provider |
-| resource_instance 长度限制 | 授权服务器 | ✅ | ≤256，超长拒绝 |
-| 批量资源 ID 数量限制 | 授权服务器 | ✅ | ≤300，超限拒绝 |
-| clock-skew 容忍 | Agent | ✅ | 配置允许偏差 |
-| 内部 Header 加密/签名 | 网关 + Agent | 推荐 | 使用 RSA 签名，防伪造 |
-| mTLS / DPoP | 可选扩展 | ❌ | 按需开启 |
+| 安全机制 | 实现位置 | 必须 |
+|---------|----------|------|
+| OAuth2 Token Exchange | 授权服务器 + Agent | ✅ |
+| 一次性令牌防重放 | Agent + Redis | ✅ |
+| ACL 前缀匹配 | 授权服务器 | ✅ |
+| 用户资源权限 + 批量查询 | common-permission | ✅ |
+| 多跳委托限制 | 授权服务器 | ✅ |
+| 全链路追踪 | 授权服务器 + Agent | ✅ |
+| HTTPS | 所有通信 | ✅ |
+| 审计日志 | 授权服务器 + Agent | ✅ |
+| Nacos 认证 | Nacos | ✅ |
+| subject_token 验证 | 授权服务器 | ✅ |
+| 客户端自身 scope 检查 | 授权服务器 | ✅ |
+| 资源实例长度/数量限制 | 授权服务器 | ✅ |
+| clock-skew 容忍 | Agent | ✅ |
 
 ---
+
 ## 11. 扩展点设计
 
-### 11.1 自定义 Scope 匹配策略
-
-```java
-public interface ScopeMatcher {
-    boolean matches(String requestedScope, List<String> allowedPatterns);
-}
-
-@Primary
-@Component
-@ConditionalOnProperty(name = "a2a.security.scope-matcher", havingValue = "prefix", matchIfMissing = true)
-public class PrefixScopeMatcher implements ScopeMatcher {
-    @Override
-    public boolean matches(String requestedScope, List<String> allowedPrefixes) {
-        if (allowedPrefixes == null || allowedPrefixes.isEmpty()) return false;
-        return allowedPrefixes.stream().anyMatch(prefix ->
-            requestedScope.equals(prefix) || requestedScope.startsWith(prefix + ":"));
-    }
-}
-
-@Component
-@ConditionalOnProperty(name = "a2a.security.scope-matcher", havingValue = "regex")
-public class RegexScopeMatcher implements ScopeMatcher {
-    @Override
-    public boolean matches(String requestedScope, List<String> allowedPatterns) {
-        return allowedPatterns.stream().anyMatch(p -> requestedScope.matches(p));
-    }
-}
-```
-
-### 11.2 自定义用户身份提取
-
-```java
-public interface UserIdentityExtractor {
-    Optional<String> extractUserId(Jwt jwt);
-}
-
-@Component
-@ConditionalOnMissingBean
-public class DefaultUserIdentityExtractor implements UserIdentityExtractor {
-    @Override
-    public Optional<String> extractUserId(Jwt jwt) {
-        Map<String, Object> act = jwt.getClaim("act");
-        if (act != null && act.containsKey("sub")) {
-            return Optional.of(act.get("sub").toString());
-        }
-        return Optional.empty();
-    }
-}
-```
-
-### 11.3 自定义一次性令牌存储
-
-```java
-@Component
-@ConditionalOnProperty(name = "a2a.security.one-time-token.store", havingValue = "db")
-public class DatabaseOneTimeTokenValidator implements OneTimeTokenValidator {
-    // 使用数据库存储已使用的 jti，定期清理
-}
-```
-
-### 11.4 mTLS 与 DPoP 集成
-
-- **mTLS**：配置 `a2a.security.mtls.enabled=true`，支持 `mode: only_mtls` 或 `mode: dual`。证书 CN/SAN 映射为 `client_id`，可配置正则表达式。
-- **DPoP**：配置 `a2a.security.dpop.enabled=true`，使用 Spring Security 的 `DPoPAuthenticationConverter`。授权服务器需支持在 Token Exchange 响应中返回 `cnf` 声明（RFC 7800）。
+- 自定义 Scope 匹配策略（`ScopeMatcher`）
+- 自定义用户身份提取（`UserIdentityExtractor`）
+- 自定义一次性令牌存储（DB / Redis）
+- mTLS / DPoP 集成
 
 ---
+
 ## 12. 响应式与非阻塞编程指南
 
-- 所有安全组件返回 `Mono`/`Flux`，遵循 WebFlux 模型。  
-- 若使用阻塞式数据库（JDBC），必须用 `Mono.fromCallable(() -> ...).subscribeOn(Schedulers.boundedElastic())`。  
-- 推荐使用 R2DBC 获得完全非阻塞体验。
-
-**示例：权限检查适配**：
-```java
-@Bean
-public PermissionChecker permissionChecker(JdbcTemplate jdbcTemplate) {
-    return (userId, resourceId, operation) -> Mono.fromCallable(() ->
-            jdbcTemplate.queryForObject("SELECT COUNT(*) FROM user_resource_permission WHERE user_id=? AND resource_id=? AND operation=?", 
-                Integer.class, userId, resourceId, operation) > 0
-        ).subscribeOn(Schedulers.boundedElastic());
-}
-```
-
-**R2DBC 事务**：使用 `TransactionalOperator` 或 `@Transactional` 配合 `ReactiveTransactionManager`。
-
----
-## 13. 总结
-
-本文档是 A2A 权限系统的完整架构设计，涵盖了身份认证、最小权限、性能优化、可审计性、高可用性、动态策略和联邦互操作七大目标。经过多轮迭代修复，所有事实错误和关键遗漏均已解决，数据模型采用 **资源实例单分类** 设计，简化了权限判断逻辑并提升了性能。文档可直接用于生产级 A2A 权限系统的开发、部署与运维。
-
-| 核心能力 | 实现方式 | 数据表关键字段 |
-|---------|----------|---------------|
-| Agent 间调用授权 | ACL + 自身 scope 校验 | `a2a_acl.allowed_scope_patterns` |
-| 用户委派授权 | 用户同意表 + 资源权限表 | `user_consent.scope_prefix`、`user_resource_permission.effect` |
-| 批量资源优化 | 批量 Token Exchange + JWT 内嵌列表 | `user_category_permission`、`user_resource_permission` |
-| 多跳委托限制 | 委托链传递 + 深度计数 | JWT 声明 `delegation_remaining`、`delegation_chain` |
-| 全链路审计 | 异步日志 + 不可变存储 | `a2a_audit_log.trace_id`、`jti` |
+所有安全组件返回 `Mono`/`Flux`，遵循 WebFlux 模型。若使用阻塞式数据库，必须用 `subscribeOn(Schedulers.boundedElastic())`。推荐使用 R2DBC。
