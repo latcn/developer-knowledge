@@ -91,17 +91,17 @@ Cedar只保留安全的、确定性的运算符集合。这不是表达能力不
 │  - 策略编写、存储、版本控制、模板                            │
 ├─────────────────────────────────────────────────────────────┤
 │  评估引擎层（Evaluation Engine）                             │
-│  - 解析器 → 评估器 → 授权器                                  │
+│  - 授权器 → 评估器                                           │
 ├─────────────────────────────────────────────────────────────┤
 │  验证层（Validation）                                        │
 │  - 类型检查、Schema验证、策略分析工具                        │
 ├─────────────────────────────────────────────────────────────┤
 │  基础设施层（Infrastructure）                                │
-│  - Rust实现、FFI绑定、JSON序列化                            │
+│  - 解析器、AST、FFI绑定、JSON序列化                         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Rust核心模块中，授权引擎（Authorizer）实现实际授权逻辑，评估器（Evaluator）负责表达式求值，解析器（Parser）负责将Cedar源码解析为AST，共同构成完整的授权引擎。
+Rust核心模块中，**Authorizer（授权器）** 是面向外部的授权接口，它调用 **Evaluator（评估器）** 进行表达式求值，并使用 **Parser（解析器）** 将策略文本解析为可执行结构。这三者共同组成Cedar的核心评估引擎。
 
 ### 3.2 核心组件详解
 
@@ -109,13 +109,13 @@ Rust核心模块中，授权引擎（Authorizer）实现实际授权逻辑，评
 
 **2. Evaluator（评估器）** ——负责执行策略中的表达式求值。表达式变量（principal、action、resource、context）先被绑定到请求中的实际值，然后进行计算，最终返回布尔值或错误。
 
-**3. Parser（解析器）** ——将人类可读的Cedar语法转换为计算机可处理的抽象语法树（AST）。
+**3. Parser（解析器）** ——将人类可读的Cedar语法转换为计算机可处理的抽象语法树（AST）。属于基础设施层。
 
 **4. Validator（验证器）** ——基于Schema检查策略的类型正确性，检测常见错误。同时支持对传入的实体数据（Entities）进行Schema验证，确保实体属性类型、层次关系符合Schema定义，从而避免运行时类型错误。
 
-### 3.3 请求处理流程
+### 3.3 请求处理流程（概述）
 
-一个典型的授权请求在Cedar中的完整处理路径如下（文字描述）：
+一个典型的授权请求在Cedar中的完整处理路径如下（简要文字描述）：
 
 1. 应用程序发起授权请求，包含主体、动作、资源、上下文以及相关实体数据。
 2. Cedar Authorizer 接收请求，从策略存储中获取策略集。
@@ -133,7 +133,102 @@ Rust核心模块中，授权引擎（Authorizer）实现实际授权逻辑，评
    - 否则，如果有任何 `permit` 策略满足 → 返回 `ALLOW`
    - 否则 → 返回 `DENY`
 
-### 3.4 验证驱动开发（VGD）
+### 3.4 授权请求的完整处理路径与组件对应（详细）
+
+本节将上述流程展开，明确每一步所使用的核心组件及其所属架构层。
+
+#### 3.4.1 四层架构与核心组件映射
+
+| 架构层 | 包含组件/数据模型 | 职责 |
+|--------|------------------|------|
+| **策略管理层** | `PolicyStore`, `PolicySet`, `TemplateStore` | 存储、检索、版本化管理策略和模板 |
+| **评估引擎层** | `Authorizer`, `Evaluator` | 执行授权决策、表达式求值 |
+| **验证层** | `Validator`, `Schema` | 策略类型检查、实体Schema验证、请求验证 |
+| **基础设施层** | `Parser`, `AST`, `FFI bindings` | 语法解析、抽象语法树生成、跨语言调用 |
+| **数据模型（输入）** | `Entities`, `Context` | 实体层次结构和请求上下文（作为评估输入） |
+
+#### 3.4.2 分步处理流程与组件标注
+
+下图展示了完整的处理路径，每一步后方括号内标注了使用的**核心组件**及所属**架构层**（括号内字母：P=策略管理层，E=评估引擎层，V=验证层，I=基础设施层）。
+
+```mermaid
+flowchart TD
+    A["1.请求接收 (组件: Authorizer E层)"] --> B["2.策略加载 (组件: PolicyStore P层)"]
+    B --> C["3.实体解析 (组件: Entities解析模块 数据模型)"]
+    C --> D["4.请求预验证（可选） (组件: Validator+Schema V层)"]
+    D --> E["5.策略预筛选：范围匹配 (组件: Authorizer+Evaluator E层)"]
+    E --> F["6.条件评估 (组件: Evaluator E层)"]
+    F --> G["7.策略效果聚合 (组件: Authorizer E层)"]
+    G --> H["8.决策裁决 (组件: Authorizer E层)"]
+    H --> I["9.诊断信息生成 (组件: Authorizer E层)"]
+    I --> J["10.响应返回 (组件: Authorizer+FFI bindings E层+I层)"]
+    
+    style A fill:#e1f5fe
+    style B fill:#fff3e0
+    style C fill:#f3e5f5
+    style D fill:#e8f5e9
+    style E fill:#fff9c4
+    style F fill:#fff9c4
+    style G fill:#fff9c4
+    style H fill:#fff9c4
+    style I fill:#fff9c4
+    style J fill:#ffe0b2
+```
+
+**各步骤详细说明**：
+
+| 步骤 | 名称 | 操作描述 | 使用的组件（架构层） | 输入 → 输出 |
+|------|------|----------|---------------------|--------------|
+| 1 | 请求接收 | 应用构造PARC（Principal, Action, Resource, Context）及可选实体数据（Entities），调用授权API。 | `Authorizer` 入口 (E) | `Request` → 内部请求对象 |
+| 2 | 策略加载 | 从策略存储中获取当前生效的所有策略（或根据请求上下文预筛选的策略子集）。 | `PolicyStore` (P) | `policySetId` → `PolicySet` |
+| 3 | 实体解析 | 将JSON格式的实体数据转换为内部实体图，并构建层次关系（parents链）。 | `Entities` 解析模块 (数据模型) | `Entities JSON` → `EntityGraph` |
+| 4 | 请求预验证（可选） | 如果提供了Schema，验证请求中的主体、动作、资源的实体类型是否存在于Schema中，以及上下文属性的类型是否匹配Schema定义（不验证具体值）。 | `Validator` + `Schema` (V) | `Request`, `Schema` → 验证通过/错误 |
+| 5 | 策略预筛选（范围匹配） | 对每条策略快速评估其 `principal`、`action`、`resource` 约束，筛除明显不匹配的策略。这一步由 `Authorizer` 驱动，调用 `Evaluator` 进行约束求值。 | `Authorizer`, `Evaluator` (E) | `PolicySet` → 候选策略列表 |
+| 6 | 条件评估（深度评估） | 对候选策略依次评估其 `when` / `unless` 条件表达式。表达式求值由 `Evaluator` 递归执行，可能访问实体属性和上下文变量。 | `Evaluator` (E) | 候选策略 → 策略满足/不满足/错误 |
+| 7 | 策略效果聚合 | 根据评估结果分别记录满足的 `forbid` 和 `permit` 策略。 | `Authorizer` (E) | 满足的策略列表 → 内部状态 |
+| 8 | 决策裁决 | 应用决策原则：若存在任何满足的 `forbid` → `DENY`；否则若有满足的 `permit` → `ALLOW`；否则 `DENY`。 | `Authorizer` (E) | 内部状态 → `Decision` |
+| 9 | 诊断信息生成 | 收集在评估过程中产生的错误（error）以及“决定性”策略（哪些策略导致了最终决策）。 | `Authorizer` (E) | 评估日志 → `Diagnostics` |
+| 10 | 响应返回 | 将决策结果和诊断信息序列化后返回给调用方（通过FFI/Java接口）。 | `Authorizer` + `FFI bindings` (E + I) | `Decision`, `Diagnostics` → `AuthorizationResponse` |
+
+#### 3.4.3 组件交互时序图（精简版）
+
+```mermaid
+sequenceDiagram
+    participant App as 应用程序
+    participant Auth as Authorizer(E)
+    participant Store as PolicyStore(P)
+    participant Eval as Evaluator(E)
+    participant Valid as Validator(V)
+    
+    App->>Auth: authorize(request, entities)
+    Auth->>Store: getPolicySet()
+    Store-->>Auth: PolicySet
+    Auth->>Auth: 解析Entities为实体图
+    alt 有Schema
+        Auth->>Valid: validateRequest(request, schema)
+        Valid-->>Auth: ok/error
+    end
+    loop 每条策略
+        Auth->>Eval: 评估范围匹配 (principal,action,resource)
+        Eval-->>Auth: true/false/error
+        alt 范围匹配
+            Auth->>Eval: 评估条件 (when/unless)
+            Eval-->>Auth: true/false/error
+        end
+    end
+    Auth->>Auth: 应用决策规则(forbid覆盖permit)
+    Auth->>Auth: 收集诊断
+    Auth-->>App: AuthorizationResponse(decision, diagnostics)
+```
+
+#### 3.4.4 关键说明
+
+- **解析器（Parser, I层）** 的调用时机：在策略加载阶段（步骤2）实际调用了 `Parser` 将Cedar文本策略解析为AST。由于解析是一次性（策略加载时）而非每次请求，上图中未单独标出，但属于基础设施层的必要前置步骤。
+- **验证层（V层）** 可以独立于请求调用（例如CI/CD中验证策略集），也可以在运行时启用（通常生产环境建议启用以快速发现类型错误）。
+- **评估引擎层（E层）** 是核心执行路径，其中 `Authorizer` 负责编排，`Evaluator` 负责表达式求值。
+- **策略管理层（P层）** 的 `PolicyStore` 可后端对接数据库、文件系统或配置中心，Cedar本身不强制存储方式。
+
+### 3.5 验证驱动开发（VGD）
 
 Cedar的安全性和正确性不是靠运气，而是靠方法论。其构建过程采用了**验证驱动开发（Verification-Guided Development）**：
 
@@ -143,6 +238,7 @@ Cedar的安全性和正确性不是靠运气，而是靠方法论。其构建过
 4. **差分测试**：验证Rust实现和Go实现与形式规约的一致性
 
 简单说：Cedar不仅写了代码，还写了数学证明来保证代码是对的。这种级别的严谨性在工业级授权系统中极为罕见。
+
 
 ## 四、核心原理与算法
 
@@ -229,6 +325,7 @@ Cedar中，实体（Entity）不仅仅是字符串标签，它们可以形成层
 ```
 
 实体层次结构支持像 `principal in UserGroup::"engineering"` 这样的表达式——Cedar会自动沿着实体树向上查找。层次结构不能有循环依赖，否则解析会报错。
+
 
 ## 五、核心功能详解
 
@@ -319,6 +416,8 @@ permit (
 // 如果需要条件，应在模板中直接编写固定条件，或者通过策略集组合实现。
 // 以上示例仅为展示模板语法结构，实际使用时需符合Cedar模板规范。
 ```
+如果模板需要条件表达式，可以编写固定的`when`条件（例如`when { resource.isPublic == true }`），但不能在条件中引用占位符。占位符仅允许出现在`principal`、`action`、`resource`的约束中。
+
 模板实例化通常通过 `@link` 属性或专用API完成，具体语法参考官方文档。
 
 ### 5.5 Schema验证
@@ -329,6 +428,7 @@ Schema定义了实体类型、属性及其类型约束。Cedar使用Schema进行
 - **请求验证**：检查授权请求是否符合Schema预期
 
 Schema采用类似JSON Schema的格式，但融入了Cedar的独特特性（如实体类型、操作组等）。强类型系统帮助策略编写者及早发现错误，但不会过于碍事——类型是可选的。
+
 
 ## 六、Java最佳实践
 
@@ -521,6 +621,7 @@ public class CedarAccessDecisionManager implements AccessDecisionManager {
 | **上下文数据缺失** | 策略意外返回Deny | 确保Context字段都存在且类型正确 |
 | **热加载策略停顿** | 更新策略集时GC压力 | 使用Copy-on-Write策略集 |
 
+
 ## 七、生产问题分类与排查
 
 ### 7.1 策略评估错误
@@ -577,6 +678,7 @@ public class CedarAccessDecisionManager implements AccessDecisionManager {
 - 遵循“一条策略做一件事”原则
 - 关注Cedar Release Notes中的breaking changes
 
+
 ## 八、调优指南
 
 ### 8.1 策略集组织
@@ -602,7 +704,7 @@ public class CedarAccessDecisionManager implements AccessDecisionManager {
 - **策略预解析**：应用启动时一次性加载和解析所有策略
 - **评估结果缓存**：对相同或相似的请求参数缓存授权结果
 - **异步授权**：将授权请求放入队列异步处理
-- **策略集预热**：应用启动时执行一次典型请求（或预热请求），确保常用策略路径被加载
+- **策略集预热**：应用启动时执行一个可预知的、能覆盖常用策略路径的测试请求（使用模拟但合法的实体数据），触发策略解析、类型检查和缓存加载
 
 ### 8.5 可观测性配置
 
@@ -639,6 +741,7 @@ public class ObservableCedarEngine {
 - [ ] 是否有任何策略评估频繁产生error？
 - [ ] 多租户场景下是否确保租户间策略隔离？
 
+
 ## 九、总结：成为Cedar专家的核心知识地图
 
 ### ✅ 思想层面（为什么要这么设计）
@@ -674,5 +777,3 @@ public class ObservableCedarEngine {
 - **社区Slack**：https://communityinviter.com/apps/cedar-policy/cedar-policy-language
 - **关键技术论文**：《Cedar: A New Language for Expressive, Fast, Safe, and Analyzable Authorization》（OOPSLA 2024）
 - **AWS Verified Permissions**：基于Cedar的托管授权服务
-
----
