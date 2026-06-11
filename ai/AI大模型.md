@@ -7,3 +7,4 @@
 *  [AI Agent](./AI-Agent完整技术指南.md)
 *  [RAG](<./RAG系统完整技术指南.md>)
 *  [向量数据库完全指南](<向量数据库完全指南.md>)
+*  [Spring AI Alibaba NL2SQL](<./Spring AI Alibaba NL2SQL.md>)
