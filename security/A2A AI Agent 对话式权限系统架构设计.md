@@ -1,4 +1,3 @@
-
 > **技术栈**  
 > - JDK 21（开启虚拟线程）  
 > - Spring Boot 3.5.3（Spring MVC + Tomcat）  
@@ -40,7 +39,6 @@
 17. [扩展点设计](#17-扩展点设计)
 
 ---
-
 ## 1. 背景与目标
 
 在政企、军工或大型金融机构的内网环境中，AI Agent 的普及带来了新的安全挑战。传统的“内网即信任”理念已不再适用，Agent 必须具备完整的权限控制能力。
@@ -55,7 +53,6 @@
 - **极简可落地**：数据模型无数据域、无工作空间、无中间表、无策略引擎、无分类标签、无菜单映射、无 JWT 权限声明、无用户属性在 Token 中。
 
 ---
-
 ## 2. 核心设计理念
 
 - **同步编码，异步性能**：全面拥抱 JDK 21 虚拟线程，以极低心智负担支撑高并发 A2A 调用与 SSE 长连接。
@@ -64,12 +61,11 @@
 - **责任链可扩展**：权限校验采用责任链模式，支持热插拔校验器。
 - **授权服务器仅做身份**：不参与任何权限决策，所有权限判断由 Agent 基于角色权限数据库完成。
 - **Token 极简化**：JWT 仅包含不可变身份标识，用户动态属性存储在 Redis 中，避免 Token 臃肿和属性变更导致的 Token 重新颁发。
-- **人工确认异步化**：不阻塞虚拟线程，通过 Redis 暂存请求上下文（加密+签名），返回确认 URL 供用户回调恢复执行。
+- **人工确认异步化**：不阻塞虚拟线程，通过 Redis 暂存请求上下文（加密+签名），返回确认 URL 供用户回调恢复执行。同时支持同步确认模式（WebSocket 推送）。
 - **A2A 标准协议**：Agent 间通信遵循 Spring AI Alibaba A2A 协议，使用 Nacos 进行服务发现与注册。
 - **全面数据签名**：所有关键暂存数据（如确认上下文）必须使用 ES256 签名，并可选加密，防止篡改与泄露。
 
 ---
-
 ## 3. 总体架构与模块划分
 
 **四个独立部署单元**：
@@ -93,13 +89,12 @@ a2a-security/
     ├── interceptor/                  # MyBatis SQL 拦截器
     ├── tool/                         # MCP Tool 安全包装器
     ├── ratelimit/                    # 限流器（滑动窗口）
-    ├── userattr/                     # 用户属性服务（Redis）
+    ├── userattr/                     # 用户属性服务（Redis + Caffeine 二级缓存）
     ├── a2a/                          # A2A 集成（Provider/Consumer + JWT透传）
     └── config/                       # 自动配置
 ```
 
 ---
-
 ## 4. 模块间依赖关系
 
 **编译时依赖**（箭头方向表示“依赖者 → 被依赖者”）：
@@ -125,7 +120,6 @@ a2a-security/
 **运行期调用关系**：授权服务器负责 Token Exchange、用户同意、ACL 白名单检查；Agent 负责对话意图解析、动态权限筛选、行级规则注入、工具调用拦截、限流，并从 Redis 获取用户属性及暂存人工确认上下文；Agent 间通过 A2A 协议通信，JWT 通过自动拦截器传递。
 
 ---
-
 ## 5. 数据模型设计
 
 ### 5.1 表清单
@@ -138,7 +132,7 @@ a2a-security/
 | `t_permission` | 权限（权限码、操作、风险、行级规则模板） |
 | `t_role_permission` | 角色-权限关联 |
 | `t_user_consent` | 用户同意记录（授权服务器用） |
-| `t_a2a_acl` | Agent 间调用白名单（简化版） |
+| `t_a2a_acl` | Agent 间调用白名单 |
 | `t_credential_vault` | 凭据保险箱（可选） |
 
 ### 5.2 DDL 语句
@@ -194,7 +188,7 @@ CREATE TABLE t_user_consent (
     expires_at   TIMESTAMP(6)
 );
 
--- Agent 间调用 ACL（仅存储允许调用）
+-- Agent 间调用 ACL
 CREATE TABLE t_a2a_acl (
     id            BIGINT AUTO_INCREMENT PRIMARY KEY,
     source_client_id VARCHAR(128) NOT NULL COMMENT 'OAuth2 client_id',
@@ -222,20 +216,18 @@ CREATE TABLE t_credential_vault (
 - **工具调用权限**：格式为 `tool:<toolName>`，例如 `tool:search_documents`, `tool:send_email`。
 - 同一个权限码同时代表资源和工具权限，系统不区分类型，统一校验。
 
-### 5.4 用户属性存储（Redis）
+### 5.4 用户属性存储（Redis + Caffeine 二级缓存）
 
-用户动态属性（如 `region_id`, `clearance`, `team_id` 等）不存储在 JWT 中，而是保存在 Redis 中，结构：
+用户动态属性（如 `region_id`, `clearance`, `team_id` 等）不存储在 JWT 中，而是保存在 Redis 中，同时本地 Caffeine 缓存作为二级缓存。
 
 ```
-Key:   user:attr:{userId}
-Value: Hash 或 JSON，例如 {"region_id":"east","clearance":"confidential","team_id":"sales_001"}
-TTL:   可配置（如 3600 秒），属性变更时主动刷新
+Redis Key:   user:attr:{userId}
+Value:       Hash 或 JSON，例如 {"region_id":"east","clearance":"confidential","team_id":"sales_001"}
+Redis TTL:   可配置（如 3600 秒）
+Caffeine TTL: 可配置（如 3600 秒），若 Redis 不可用则使用本地缓存（可能过期）
 ```
-
-Agent 在需要用户属性时（如 SQL 行级规则注入、风险判断）通过 `UserAttributeService` 从 Redis 获取。授权服务器颁发 Token 时不携带这些属性。
 
 ---
-
 ## 6. 核心组件：责任链与对话引擎
 
 ### 6.1 PermissionCheckHandler 接口
@@ -399,7 +391,7 @@ public class PermissionContextHolder {
 }
 ```
 
-### 6.8 权限缓存失效机制（完整实现）
+### 6.8 权限缓存失效机制
 
 ```java
 @Component
@@ -422,7 +414,6 @@ public class PermissionCacheInvalidationListener {
 ```
 
 ---
-
 ## 7. 授权服务器 Token 设计（增强）
 
 ### 7.1 JWT 声明
@@ -460,32 +451,58 @@ spring:
 
 若环境不支持 EC，可回退到 RS256，但强烈建议使用 ES256。
 
-### 7.3 用户属性 Redis 存储及失效监听
+### 7.3 用户属性 Redis 存储（二级缓存 + 降级）
 
-Agent 收到请求后，根据 JWT 中的 `sub` 从 Redis 获取用户属性：
+Agent 收到请求后，根据 JWT 中的 `sub` 从 Redis 获取用户属性，本地 Caffeine 作为二级缓存：
 
 ```java
 @Service
 public class UserAttributeService {
     private final RedisTemplate<String, Object> redisTemplate;
+    private final Cache<String, Map<String, Object>> localCache; // Caffeine
     
     public Map<String, Object> getUserAttributes(String userId) {
+        // 1. 本地缓存
+        Map<String, Object> cached = localCache.getIfPresent(userId);
+        if (cached != null) return cached;
+        
+        // 2. Redis
         String key = "user:attr:" + userId;
         Map<Object, Object> entries = redisTemplate.opsForHash().entries(key);
-        if (entries.isEmpty()) {
-            Map<String, Object> dbAttrs = loadFromDatabase(userId);
-            redisTemplate.opsForHash().putAll(key, dbAttrs);
-            redisTemplate.expire(key, Duration.ofHours(1));
-            return dbAttrs;
+        if (!entries.isEmpty()) {
+            Map<String, Object> result = convert(entries);
+            localCache.put(userId, result);
+            return result;
         }
-        return entries.entrySet().stream()
-            .collect(Collectors.toMap(e -> (String) e.getKey(), Map.Entry::getValue));
+        
+        // 3. 数据库加载
+        Map<String, Object> dbAttrs = loadFromDatabase(userId);
+        redisTemplate.opsForHash().putAll(key, dbAttrs);
+        redisTemplate.expire(key, Duration.ofHours(1));
+        localCache.put(userId, dbAttrs);
+        return dbAttrs;
+    }
+    
+    // Redis 不可用时降级
+    @CircuitBreaker(name = "redis", fallbackMethod = "getFromLocalCacheOnly")
+    public Map<String, Object> getUserAttributesWithFallback(String userId) {
+        return getUserAttributes(userId);
+    }
+    
+    private Map<String, Object> getFromLocalCacheOnly(String userId, Throwable t) {
+        Map<String, Object> local = localCache.getIfPresent(userId);
+        if (local != null) {
+            log.warn("Redis unavailable, using stale local cache for user {}", userId);
+            return local;
+        }
+        throw new DataAccessException("无法获取用户属性，且无本地缓存");
     }
     
     @EventListener
     public void refreshUserAttributes(UserAttributeChangedEvent event) {
         String key = "user:attr:" + event.getUserId();
         redisTemplate.delete(key);
+        localCache.invalidate(event.getUserId());
         redisTemplate.convertAndSend("userattr:invalidate", event.getUserId());
     }
 }
@@ -509,11 +526,10 @@ public class UserAttributeInvalidationListener {
 - 用户认证
 - 客户端认证
 - 用户同意管理（记录在 `t_user_consent`，仅用于合规展示）
-- **Token Exchange**：支持 `urn:ietf:params:oauth:grant-type:token-exchange`，将上游用户的 JWT 与调用 Agent 的客户端凭证交换为新的 JWT，检查 `t_a2a_acl` 并填充 `allowed_permission_ids` 和 `delegated_by`、`aud`
+- **Token Exchange**：支持 `urn:ietf:params:oauth:grant-type:token-exchange`，将上游用户的 JWT 与调用 Agent 的客户端凭证交换为新的 JWT，检查 `t_a2a_acl` 并填充 `allowed_permission_ids` 和 `delegated_by`、`aud`，同时支持 Token 缓存复用（TTL 30秒）以减少授权服务器压力。
 - 签发 JWT（不查角色权限，不写用户属性，但 Token Exchange 时会从用户角色中提取权限ID）
 
 ---
-
 ## 8. 对话驱动的动态授权与人工确认
 
 ### 8.1 完整流程
@@ -533,14 +549,14 @@ sequenceDiagram
     Agent->>Agent: 检查是否拥有所有 requiredPermissions
     alt 需要人工确认
         Agent->>Redis: 暂存请求上下文（加密+签名，pending_confirm:xxx）
-        Agent-->>User: 返回 202 + 确认URL
-        User->>Agent: 访问确认URL（需认证，approved=true）
+        Agent-->>User: 返回 202 + 确认URL（异步）或 WebSocket 等待（同步）
+        User->>Agent: 访问确认URL（需认证，approved=true）或 WebSocket 响应
         Agent->>Agent: 验证当前用户与暂存userId一致
         Agent->>Redis: 获取并删除暂存数据（验签+解密）
-        Agent->>Agent: 异步继续执行原请求
+        Agent->>Agent: 异步/同步继续执行原请求
         Agent->>DataSource: 执行带行级条件的 SQL
         DataSource-->>Agent: 数据
-        Agent-->>User: 结果（通过通知或轮询）
+        Agent-->>User: 结果（通过通知或轮询或直接返回）
     else 无需确认
         Agent->>DataSource: 执行 SQL
         DataSource-->>Agent: 数据
@@ -559,9 +575,9 @@ sequenceDiagram
 }
 ```
 
-### 8.3 人工确认实现（HTTP + Redis，异步回调，加密+签名+用户绑定）
+### 8.3 人工确认实现（混合模式：异步 + 同步 WebSocket）
 
-采用**异步确认**模式：Agent 遇到需要人工确认的权限时，不阻塞等待，而是将请求上下文暂存到 Redis（加密+签名），返回确认 URL 给用户，用户认证后确认，通过回调恢复执行。
+采用**混合模式**：默认异步返回确认 URL，同时支持同步 WebSocket 等待以改善对话体验。
 
 #### 8.3.1 暂存数据结构
 
@@ -578,7 +594,7 @@ public class ConfirmPendingData {
 }
 ```
 
-#### 8.3.2 加密与签名服务（增强）
+#### 8.3.2 加密与签名服务
 
 ```java
 @Component
@@ -625,69 +641,68 @@ public class DataCryptoSigner {
 }
 ```
 
-#### 8.3.3 核心服务（RiskConfirmService）
+#### 8.3.3 核心服务（混合确认）
 
 ```java
 @Service
-public class RiskConfirmService {
+public class HybridRiskConfirmService {
     private final RedisTemplate<String, String> redisTemplate;
     private final DataCryptoSigner cryptoSigner;
     private final ExternalNotifier notifier;
     private final AsyncTaskExecutor asyncExecutor;
-    private final BusinessService businessService;
-    private final AuditService auditService;
+    private final SimpMessagingTemplate messagingTemplate; // WebSocket
+    private final Map<String, CompletableFuture<Boolean>> waitingRequests = new ConcurrentHashMap<>();
     
     private static final Duration PENDING_TTL = Duration.ofMinutes(5);
     private static final int MAX_USER_PENDING = 5;
     
-    public String requestConfirm(PermissionCheckContext ctx, String requestConfirmId, Map<String, Object> originalRequest) {
+    // 异步模式（原有）
+    public String requestConfirmAsync(PermissionCheckContext ctx, String requestConfirmId, Map<String, Object> originalRequest) {
+        // 同之前实现，返回 confirmUrl
+    }
+    
+    // 同步模式（新增，WebSocket 等待）
+    public void requestConfirmSync(PermissionCheckContext ctx, String requestConfirmId, Map<String, Object> originalRequest, Duration timeout) {
         String userId = ctx.getUserId();
-        // 限流控制
-        String userLimitKey = "pending_limit:" + userId;
-        Long count = redisTemplate.opsForValue().increment(userLimitKey);
-        if (count == 1) redisTemplate.expire(userLimitKey, PENDING_TTL);
-        if (count > MAX_USER_PENDING) {
-            redisTemplate.decrement(userLimitKey);
-            throw new RateLimitException("您有未完成的确认请求，请先处理");
-        }
+        String confirmId = UUID.randomUUID().toString();
+        storePendingData(confirmId, ctx, requestConfirmId, originalRequest);
+        // 通过 WebSocket 推送确认卡片
+        messagingTemplate.convertAndSendToUser(userId, "/queue/confirm", Map.of("confirmId", confirmId, "message", buildConfirmMessage(ctx)));
+        
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        waitingRequests.put(confirmId, future);
         try {
-            String confirmId = UUID.randomUUID().toString();
-            ConfirmPendingData data = new ConfirmPendingData();
-            data.setCtx(ctx);
-            data.setOriginalRequest(originalRequest);
-            data.setUserId(userId);
-            data.setRequestConfirmId(requestConfirmId);
-            data.setCreateTime(System.currentTimeMillis());
-            String encryptedAndSigned = cryptoSigner.encryptAndSign(data);
-            String key = "pending_confirm:" + confirmId;
-            redisTemplate.opsForValue().set(key, encryptedAndSigned, PENDING_TTL);
-            String confirmUrl = generateConfirmUrl(confirmId);
-            notifier.send(userId, buildConfirmMessage(ctx, confirmUrl));
-            return confirmUrl;
+            boolean approved = future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            if (approved) {
+                cacheConfirm(userId, requestConfirmId);
+                return; // 继续执行原请求
+            } else {
+                throw new ConfirmRejectedException();
+            }
+        } catch (TimeoutException e) {
+            throw new ConfirmTimeoutException();
         } finally {
-            redisTemplate.decrement(userLimitKey);
+            waitingRequests.remove(confirmId);
+            redisTemplate.delete("pending_confirm:" + confirmId);
         }
     }
     
-    public boolean handleConfirm(String confirmId, boolean approved, String currentUserId) {
-        String key = "pending_confirm:" + confirmId;
-        String encryptedSigned = redisTemplate.opsForValue().getAndDelete(key);
-        if (encryptedSigned == null) return false;
-        ConfirmPendingData data = cryptoSigner.verifyAndDecrypt(encryptedSigned, ConfirmPendingData.class);
-        // 验证当前用户身份
-        if (!data.getUserId().equals(currentUserId)) {
-            auditService.logUnauthorizedConfirmAttempt(currentUserId, confirmId);
-            return false;
+    // WebSocket 接收确认结果
+    @MessageMapping("/confirm")
+    public void handleUserConfirm(@Payload ConfirmMessage msg) {
+        CompletableFuture<Boolean> future = waitingRequests.get(msg.getConfirmId());
+        if (future != null) {
+            future.complete(msg.isApproved());
         }
-        if (approved) {
-            // 缓存请求级确认结果
-            String cacheKey = "confirm:" + data.getUserId() + ":" + data.getRequestConfirmId();
-            redisTemplate.opsForValue().set(cacheKey, "true", Duration.ofMinutes(5));
-            asyncExecutor.submit(() -> continueRequest(data));
-        } else {
-            auditService.logDenied(data);
-        }
-        return true;
+    }
+    
+    private void storePendingData(String confirmId, PermissionCheckContext ctx, String requestConfirmId, Map<String, Object> originalRequest) {
+        ConfirmPendingData data = new ConfirmPendingData(ctx, originalRequest);
+        data.setUserId(ctx.getUserId());
+        data.setRequestConfirmId(requestConfirmId);
+        data.setCreateTime(System.currentTimeMillis());
+        String encryptedAndSigned = cryptoSigner.encryptAndSign(data);
+        redisTemplate.opsForValue().set("pending_confirm:" + confirmId, encryptedAndSigned, PENDING_TTL);
     }
     
     public boolean hasConfirmed(String userId, String requestConfirmId) {
@@ -695,24 +710,20 @@ public class RiskConfirmService {
         return Boolean.TRUE.equals(redisTemplate.hasKey(key));
     }
     
-    private void continueRequest(ConfirmPendingData data) {
-        PermissionContextHolder.set(data.getCtx());
-        try {
-            businessService.execute(data);
-        } finally {
-            PermissionContextHolder.clear();
-        }
+    private void cacheConfirm(String userId, String requestConfirmId) {
+        String key = "confirm:" + userId + ":" + requestConfirmId;
+        redisTemplate.opsForValue().set(key, "true", Duration.ofMinutes(5));
     }
 }
 ```
 
-#### 8.3.4 确认端点（ConfirmController）带身份校验
+#### 8.3.4 确认端点（HTTP 回调，保留异步模式）
 
 ```java
 @RestController
 @RequestMapping("/api")
 public class ConfirmController {
-    private final RiskConfirmService confirmService;
+    private final HybridRiskConfirmService confirmService;
     
     @PostMapping("/confirm/{confirmId}")
     public ResponseEntity<String> confirm(
@@ -722,7 +733,6 @@ public class ConfirmController {
         if (authentication == null || !authentication.isAuthenticated()) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("需要登录");
         }
-        // 兼容各种 Authentication 实现（JWT、Session等）
         String currentUserId = authentication.getName();
         boolean handled = confirmService.handleConfirm(confirmId, approved, currentUserId);
         if (!handled) {
@@ -749,7 +759,7 @@ public class ConfirmController {
 - Key: `confirm:{userId}:{requestConfirmId}`，Value: `"true"`，TTL 默认 5 分钟。
 - 用户角色变更或登出时，通过 Redis Pub/Sub 广播清除该用户的所有确认缓存。
 
-### 8.5 A2A 场景的权限传递（Token Exchange）
+### 8.5 A2A 场景的权限传递（Token Exchange + 可选 JWT 嵌套）
 
 上游 Agent 调用下游 Agent 时，**不得自行传递 `allowed_permission_ids`**。正确流程：
 
@@ -767,7 +777,6 @@ public class ConfirmController {
 4. 下游 Agent 收到请求后，验证 JWT 签名和 `aud` 是否匹配自身名称，检查 `delegated_by` 是否存在且未被吊销，然后使用 `allowed_permission_ids` 进行权限判断（不再查询用户角色）。可选开启 `verify-permissions-vs-db` 进行二次校验。
 
 ---
-
 ## 9. 权限执行层：SQL 拦截与行级规则注入
 
 ### 9.1 MyBatis 拦截器实现（完整参数绑定）
@@ -825,7 +834,7 @@ public class RowRuleInterceptor implements Interceptor {
 }
 ```
 
-### 9.2 安全要求
+### 9.2 安全要求与规则校验
 
 - 行级规则模板在权限入库时（`t_permission.row_rule_template`）必须经过校验，禁止包含 `UNION`、`DROP`、`--` 等危险 SQL 关键字。
 - `#{user.xxx}` 中的 `xxx` 必须在配置的 `a2a.security.row-rule.allowed-attr-keys` 白名单内（如 `id`, `region_id`, `clearance`），防止 SpEL 注入。
@@ -847,6 +856,25 @@ public class RowRuleTemplateValidator {
 }
 ```
 
+**规则预览与冲突检测**（管理后台功能）：
+```java
+public interface RowRulePreviewService {
+    String previewSql(String originalSql, String userId, List<String> permissionIds);
+    List<RuleConflictWarning> detectConflicts(List<Permission> permissions);
+}
+```
+
+**限制单表规则数量**：配置 `a2a.security.row-rule.max-rules-per-table = 5`。
+
+**用户属性缺失时的降级行为**：
+```yaml
+a2a:
+  security:
+    row-rule:
+      fallback-on-missing-attr: REJECT   # REJECT, USE_EMPTY, USE_DEFAULT
+      default-empty-result: true          # 若 USE_EMPTY，返回空结果集
+```
+
 ### 9.3 行级规则合并策略（可配置）
 
 ```java
@@ -862,7 +890,13 @@ public class OrMergeStrategy implements RowRuleMergeStrategy {
     }
 }
 
-// 可扩展 AND 策略或自定义逻辑
+// AND 策略
+@Component
+public class AndMergeStrategy implements RowRuleMergeStrategy {
+    public String merge(String existing, String newCondition) {
+        return "(" + existing + " AND " + newCondition + ")";
+    }
+}
 ```
 
 配置示例：
@@ -871,14 +905,12 @@ a2a:
   security:
     row-rule:
       merge-strategy: OR   # OR, AND, custom_bean_name
-      fallback-on-parse-error: DENY
 ```
 
 ---
-
 ## 10. 大模型原生安全防护（MCP Tool 调用）
 
-### 10.1 工具调用统一包装器（修正上下文设置）
+### 10.1 工具调用统一包装器（设置上下文）
 
 ```java
 @Component
@@ -1012,7 +1044,6 @@ public class JwtHolder {
 ```
 
 ---
-
 ## 11. 限流与熔断
 
 使用 Redis ZSET 实现真正的滑动窗口限流，并防止内存泄漏。
@@ -1081,7 +1112,6 @@ a2a:
 超过限制返回 HTTP 429。
 
 ---
-
 ## 12. Agent间调用安全（基于 Spring AI Alibaba A2A）
 
 ### 12.1 A2A 协议与架构概览
@@ -1154,7 +1184,7 @@ spring:
 
 ### 12.3 调用 A2A 远程智能体（Consumer Agent）
 
-**第一步：配置发现与重试（application.yml）**
+**第一步：配置发现（application.yml）**
 
 ```yaml
 spring:
@@ -1244,6 +1274,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 - 根据当前客户端认证的 `client_id`（即上游 Agent）和 `target_agent` 查询 `t_a2a_acl`。
 - 若允许，从 `subject_token` 中提取用户 ID，查询用户角色权限。
 - 生成新 JWT，设置 `sub`（原用户）、`aud = target_agent`、`delegated_by = source_client_id`、`allowed_permission_ids = 用户权限 ∩ 上游请求权限`。
+- 可选：缓存 Token 30 秒以减少重复签发。
 
 **下游 Agent 校验 JWT**：
 - 验证签名、有效期、`iss`。
@@ -1273,7 +1304,6 @@ a2a:
 ```
 
 ---
-
 ## 13. 数据签名与验签（ES256）及加密
 
 ### 13.1 签名与加密范围
@@ -1314,7 +1344,6 @@ a2a:
 ```
 
 ---
-
 ## 14. 配置与部署
 
 ### 14.1 application.yml 完整示例
@@ -1380,14 +1409,20 @@ a2a:
       permission-ttl-seconds: 300
     user-attr:
       ttl-seconds: 3600
+      local-cache-ttl-seconds: 3600
+      redis-fallback-enabled: true
     row-rule:
       enabled: true
       dangerous-keywords: ["UNION", "DROP", "--"]
       allowed-attr-keys: ["id", "region_id", "clearance", "team_id", "department"]
       merge-strategy: OR
       fallback-on-parse-error: DENY
+      fallback-on-missing-attr: REJECT
+      max-rules-per-table: 5
     hitl:
       enabled: true
+      mode: hybrid
+      sync-timeout-seconds: 30
       pending-ttl-seconds: 300
       max-pending-per-user: 5
       rate-limit-per-minute: 3
@@ -1401,6 +1436,8 @@ a2a:
     token-exchange:
       verify-permissions-vs-db: false
       verify-delegated-by-active: true
+      cache-ttl-seconds: 30
+      enable-jwt-nesting: false
     data-signature:
       enabled: true
       algorithm: ES256
@@ -1428,6 +1465,9 @@ a2a:
         queue-size: 10000
         never-block: false
         discarding-threshold: 0.8
+      enable-sensitive-masking: true
+      mask-char: "*"
+      sensitive-field-annotation: "io.github.latcn.a2a.security.annotation.Sensitive"
 ```
 
 ### 14.2 启动检查清单
@@ -1438,25 +1478,25 @@ a2a:
 - [ ] 生成 ES256 密钥对，配置授权服务器 JWKS。
 - [ ] 生成 AES 密钥，设置环境变量 `A2A_ENCRYPTION_KEY`、`A2A_CREDENTIAL_ENCRYPTION_KEY`。
 - [ ] 实现意图解析服务，输出 `requiredPermissions` 集合。
-- [ ] 配置 HTTP 确认端点 `/api/confirm/{confirmId}` 及外部通知服务（邮件/钉钉等），确保端点强制认证。
+- [ ] 配置 HTTP 确认端点 `/api/confirm/{confirmId}` 及外部通知服务（邮件/钉钉等），确保端点强制认证；若使用同步模式，配置 WebSocket 支持。
 - [ ] 注册 MyBatis 拦截器 `RowRuleInterceptor`。
-- [ ] 配置审计日志（异步文件或 Kafka）。
+- [ ] 配置审计日志（异步文件或 Kafka），并启用敏感数据脱敏。
 - [ ] 实现权限缓存失效监听器（基于 Redis Pub/Sub）。
-- [ ] 实现用户属性加载服务（数据库 → Redis），并配置属性变更刷新端点。
+- [ ] 实现用户属性加载服务（数据库 → Redis + Caffeine），并配置属性变更刷新端点。
 - [ ] 配置 Nacos 注册中心及 Agent 服务发现。
 - [ ] 添加 `spring-ai-alibaba-starter-a2a-nacos` 依赖，验证 A2A Server 自动注册。
-- [ ] 为 Consumer Agent 配置 A2A Discovery 和 JWT 透传 RestClient。
+- [ ] 为 Consumer Agent 配置 A2A Discovery 和 JWT 透传 RestClient，配置重试与降级。
 - [ ] 实现数据加密+签名工具类，集成到 `RiskConfirmService`。
-- [ ] 实现 Token Exchange 端点，支持代理授权并填充 `aud`。
+- [ ] 实现 Token Exchange 端点，支持代理授权并填充 `aud`，配置 Token 缓存。
 - [ ] 配置下游 Agent 的 JWT 解码器，验证 `aud` 声明。
 - [ ] 可选：配置 mTLS 证书与 DPoP 逻辑。
 - [ ] 根据并发量调优 HikariCP 最大连接数（建议 >= 预期虚拟线程并发数）。
 - [ ] 验证限流 key 命名不与业务冲突。
 - [ ] 测试 A2A 远程调用的重试与降级策略。
+- [ ] 验证行级规则预览与冲突检测功能（管理后台）。
 
 ---
-
-## 15. 审计日志设计
+## 15. 审计日志设计（含敏感信息脱敏）
 
 每条决策记录为 JSON Lines，支持异步写入 Kafka 或文件。
 
@@ -1484,44 +1524,67 @@ a2a:
 }
 ```
 
+**敏感数据脱敏**：
+
+定义注解：
+```java
+@Target(ElementType.FIELD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Sensitive {
+    String value() default "DEFAULT";
+}
+```
+
+日志脱敏切面：
+```java
+@Component
+public class SensitiveDataMasker {
+    public String mask(Object obj) {
+        // 使用 Jackson 遍历字段，若字段有 @Sensitive 注解，替换为 "***"
+    }
+}
+```
+
+在记录审计日志前，对 `originalRequest` 和 SQL 参数进行脱敏处理。
+
 - 使用 `AsyncAppender` 时设置 `queue-size=10000`、`neverBlock=false`、`discardingThreshold=0.8`。
 - 若配置 `mode: kafka`，则直接发送到 Kafka 主题，避免阻塞。
 - 每天轮转，保留 30 天，自动压缩。
 
 ---
-
 ## 16. 安全加固矩阵
 
 | 安全机制 | 实现位置 | 必须 |
 |---------|----------|------|
-| OAuth2 Token Exchange | 授权服务器+Agent | ✅ |
+| OAuth2 Token Exchange + 缓存复用 | 授权服务器 | ✅ |
 | JWT ES256 椭圆曲线签名 | 授权服务器 | ✅ |
 | JWT 受众（aud）校验 | 下游 Agent | ✅ |
 | 一次性令牌防重放 | Agent+Redis | ✅ |
 | A2A ACL（白名单） | 授权服务器 | ✅ |
 | 角色权限 + 行级规则 | Agent+SQL拦截器 | ✅ |
-| 对话风险自动/人工确认（异步） | Agent+HITL | ✅ |
+| 对话风险自动/人工确认（混合模式） | Agent+HITL | ✅ |
 | 请求级确认（权限组合哈希） | Agent+HITL | ✅ |
 | 确认端点身份绑定 | Agent+Spring Security | ✅ |
 | 暂存数据 AES-GCM 加密 | Agent+Redis | ✅ |
 | 暂存数据 ES256 签名 | Agent+Redis | ✅ |
 | 工具调用权限（权限码） | Agent+Tool包装器 | ✅ |
 | 凭据保险箱 | 授权服务器+Agent | ✅ |
-| 用户属性 Redis 存储+主动刷新+广播 | Agent+Redis | ✅ |
+| 用户属性二级缓存 + Redis 降级 | Agent+Redis+Caffeine | ✅ |
+| 用户属性变更广播与监听 | Agent+Redis | ✅ |
 | A2A 协议 + Nacos 服务发现 | Spring AI Alibaba | ✅ |
 | JWT 自动透传 | RestClient 拦截器 | ✅ |
 | 行级规则模板白名单防 SpEL 注入 | Agent+校验器 | ✅ |
 | 可配置行级规则合并策略 | Agent+策略模式 | ✅ |
 | SQL 解析失败降级策略 | Agent+MyBatis拦截器 | ✅ |
+| 行级规则预览与冲突检测 | 管理后台 | 推荐 |
 | 限流（滑动窗口，防内存泄漏） | Agent+Redis | ✅ |
-| 审计日志（非阻塞） | Logback/Kafka | ✅ |
+| 审计日志（非阻塞+脱敏） | Logback/Kafka | ✅ |
 | 防 HITL 攻击（并发+限流+TTL+身份绑定） | Agent+Redis | ✅ |
 | A2A 调用重试与降级 | Consumer Agent | 推荐 |
 | Agent 间 mTLS | 网络层/Agent | 可选 |
 | DPoP 令牌绑定 | Agent 应用层 | 可选 |
 
 ---
-
 ## 17. 扩展点设计
 
 - **自定义 `PermissionCheckHandler`**：实现接口并注册为 Bean，自动加入责任链。  
@@ -1535,3 +1598,5 @@ a2a:
 - **自定义 `ExternalNotifier`**：替换默认的外部通知实现（邮件、钉钉、短信等）。
 - **自定义 `SignatureProvider` / `EncryptionProvider`**：替换默认 ES256 签名或 AES 加密。
 - **A2A 协议定制**：扩展 `A2aRemoteAgent` 的调用行为，支持自定义序列化、拦截器等。
+- **自定义 `RowRulePreviewService`**：实现规则预览与冲突检测逻辑。
+- **自定义 `SensitiveDataMasker`**：定制脱敏规则。
