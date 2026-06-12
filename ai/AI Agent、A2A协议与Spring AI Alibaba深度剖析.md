@@ -1,4 +1,7 @@
+
 > 本文以费曼学习法（复杂概念→简化讲解→复述输出→简化迭代）为方法论，以第一性原理（回归事物本源、从根本原理出发推演）为思维框架，系统解析AI Agent多智能体技术栈。目标：帮助读者从“会用”到“懂其所以然”，达到专家级认知水平。
+>
+> ⚠️ **时效性提醒**：本文基于Spring AI Alibaba v1.1.2.0（2026年2月发布）及v1.1.2.2（2026年3月），A2A协议1.0规范。相关技术和API仍在快速演进，请以官方文档和源代码仓库的最新内容为准。建议定期查阅Spring AI Alibaba GitHub Releases（https://github.com/alibaba/spring-ai-alibaba）以及A2A Java SDK（https://github.com/lf-ai-data/a2a-java-sdk）。如需术语速查，可使用浏览器页面搜索功能。
 
 ## 一、从“全能上帝”到“专家团队”：AI Agent的核心演进逻辑
 
@@ -15,7 +18,6 @@
 ### 1.2 架构演进三阶段
 
 AI从静态响应到协作系统的跃迁经历了三个阶段：
-
 1. **静态响应**：单一大模型根据输入生成文本
 2. **自动执行**：Agent可调用工具、插件、外部API
 3. **协作系统**：多Agent通过统一框架协同完成复杂任务
@@ -34,10 +36,29 @@ AI从静态响应到协作系统的跃迁经历了三个阶段：
 - **中心化模式（Hub-and-Spoke）** ：以Manager Agent为中心分发任务，适用于复杂全局统筹
 - **去中心化模式（Mesh/Swarm）** ：Agent之间自由广播消息，谁能解决谁响应
 
-**共享记忆（Shared Memory）** ：多个Agent如何同步信息？仅靠对话历史容易超出Token限制。工程解法是引入 **“黑板模式”** ——建立一个全局共享的数据库或状态机，所有Agent从黑板上读取当前进度，并将产出写回黑板。
+**共享记忆（Shared Memory）** ：多个Agent如何同步信息？仅靠对话历史容易超出Token限制。工程解法是引入 **“黑板模式”** ——建立一个全局共享的数据库或状态机，所有Agent从黑板上读取当前进度，并将产出写回黑板。**分布式环境下的实现**：可使用Redis、MySQL或内存网格（如Hazelcast）作为共享存储；Spring AI Alibaba未内置分布式黑板，需自行集成。
 
+**分布式黑板实现示例（Redis）**：
+```java
+@Component
+public class RedisSaver implements Saver {  // Saver为Spring AI Alibaba的持久化接口
+    private final RedisTemplate<String, Object> redis;
+    @Override
+    public void save(String key, Object value) {
+        redis.opsForValue().set(key, value, Duration.ofHours(1));
+    }
+    @Override
+    public Object load(String key) {
+        return redis.opsForValue().get(key);
+    }
+}
+// 在Agent中使用
+agent.setSaver(redisSaver);
+```
 
 ## 二、A2A协议：Agent之间的“TCP/IP”
+
+> **说明**：本章整合了原第八章MCP关系内容，避免重复。
 
 ### 2.1 第一性原理：Agent之间为什么需要统一协议？
 
@@ -79,8 +100,17 @@ A2A（Agent2Agent）协议正是为解决这个问题而生。**溯源**：该�
 
 MCP于2025年12月被Anthropic捐赠给Linux Foundation，成立Agentic AI Foundation（AAIF）作为治理主体。至2026年4月时已超过10,000个公开服务器和每月9,700万SDK下载量。MCP与A2A在Linux Foundation的LF AI & Data下统一管理。
 
-> **关于ACP**：IBM的Agent Communication Protocol（ACP）已正式并入A2A协议，ACP的开发已逐步停止，新项目应直接使用A2A。
+MCP与A2A的详细对比见下表：
 
+| 维度 | MCP | A2A |
+|------|-----|-----|
+| **目的** | 模型↔工具接口 | 代理↔代理接口 |
+| **关注焦点** | 工具访问、上下文连接 | 发现、委派、协作 |
+| **标准化主体** | Anthropic → Linux Foundation（2025年12月） | Google → Linux Foundation（2025年6月） |
+| **关键概念** | Tool、Resource、Server | AgentCard、Task、AgentSkill |
+| **通信方式** | JSON-RPC over HTTP/WebSocket | HTTP/SSE、JSON-RPC |
+
+> **关于ACP**：IBM的Agent Communication Protocol（ACP）已正式并入A2A协议，ACP的开发已逐步停止，新项目应直接使用A2A。
 
 ## 三、Spring AI Alibaba：Java生态的Agentic AI Framework
 
@@ -109,25 +139,27 @@ Observation（观察）：工具返回了什么结果？
 → 继续思考 → 继续行动 → 直到目标达成
 ```
 
+**ReactAgent与Graph的关系**：ReactAgent内部构建了一个包含`think`、`act`、`observe`节点的子图。当调用`agent.call(input)`时，Graph运行时反复执行该子图直到输出最终结果或达到最大迭代次数。这使得ReAct循环可以被Graph的调试、状态持久化、条件分支等能力增强。
+
 ### 3.4 内置多智能体编排模式
 
 Spring AI Alibaba预置了多种Multi-agent基础工作流模式：
 
-| 模式 | 工作原理 | 适用场景 |
-|------|---------|---------|
-| **SequentialAgent** | Agent链式执行，输出作为下一个输入 | 代码写作→审查→文档生成的流水线 |
-| **ParallelAgent** | 多个Agent并发执行后合并结果 | 从不同角度分析同一问题 |
-| **LlmRoutingAgent** | 根据输入动态路由到相应Agent，可一次选择多个子智能体并行执行 | 意图识别后的任务分发、多领域并行查询 |
-| **LoopAgent** | 循环执行直到条件满足 | 多轮迭代优化 |
+| 模式 | 工作原理 | 适用场景 | ⚠️ 不适用场景 |
+|------|---------|---------|-------------|
+| **SequentialAgent** | Agent链式执行，输出作为下一个输入 | 代码写作→审查→文档生成的流水线 | 步骤间有复杂依赖或条件分支 |
+| **ParallelAgent** | 多个Agent并发执行后合并结果 | 从不同角度分析同一问题 | 任务间有状态依赖 |
+| **LlmRoutingAgent** | 根据输入动态路由到相应Agent，可一次选择多个子智能体并行执行 | 意图识别后的任务分发、多领域并行查询 | 路由决策需要精确规则而非LLM判断 |
+| **LoopAgent** | 循环执行直到条件满足 | 多轮迭代优化 | 循环次数不可预测且无终止条件 |
 
-> **关于SupervisorAgent**：在1.1.2.1版本中已被弃用，可参考官方示例自行构建监督模式代理。
+> **关于SupervisorAgent**：在1.1.2.1版本中已被弃用。官方推荐使用**指挥官模式**自行构建（详见第五章），或结合`LlmRoutingAgent`与`Handoffs`实现监督式路由。
 
 ### 3.5 Graph工作流核心能力
 
 Spring AI Alibaba的Graph层来源于LangGraph设计理念，在Java生态中进行了深度优化，提供了精细的多智能体工作流协调机制：
 
 - **并行节点与并行边**：Graph支持并行条件边（`addParallelConditionalEdges`）
-- **并行聚合策略**：支持**AllOf**（等待所有并行任务完成后再合并）和**AnyOf**（任一任务完成即合并）两种策略汇总结果
+- **并行聚合策略**：支持**AllOf**（等待所有并行任务完成后再合并）和**AnyOf**（任一任务完成即合并）两种策略汇总结果。**异常处理**：AllOf策略下，若任一子任务抛出异常，整体工作流默认快速失败，可通过自定义`merge`函数实现部分成功（例如跳过失败任务）。
 - **异步工具执行**：Graph的`AgentToolNode`支持异步工具执行，避免耗时操作阻塞工作流
 - **StateGraph"先定义后执行"模式**
 - **三种边类型**：普通边（固定顺序）、条件边（动态路由）、并行边（多节点同时执行）
@@ -135,6 +167,10 @@ Spring AI Alibaba的Graph层来源于LangGraph设计理念，在Java生态中进
 ### 3.6 Agent Skills：渐进式知识调度
 
 Spring AI Alibaba 1.1.2.0中，ReactAgent集成了Agent Skills能力——让Agent以「技能」为单位的渐进式知识调度，支持**可复用指令与上下文的渐进式披露**，在相关任务时由智能体自动发现并按需加载，从而降低Token消耗、扩展能力规模。
+
+**Skill与Tool的区别**：
+- **Tool**：可被Agent调用的函数/API，有明确的输入输出schema，执行后返回结果。例如：`getWeather(city)`。
+- **Skill**：一个Markdown文件（SKILL.md），描述一组**指导性的流程、最佳实践或上下文**，可绑定零个或多个Tool。Agent通过`read_skill(skill_name)`加载Skill的完整说明，然后按照说明调用相应的Tool。Skill本身不执行代码。
 
 **渐进式披露三阶段**：
 - 系统提示中先只注入技能列表（name、description、skillPath）
@@ -164,7 +200,6 @@ Spring AI Alibaba在Multi-agent系统中提供细粒度的上下文控制，关�
 | `{stateKey}` | 引用状态中的任意键值 | 访问状态中的任何数据 |
 
 系统质量在很大程度上取决于上下文工程的质量，目标确保每个Agent都能访问执行任务所需的正确数据。
-
 
 ## 四、A2A分布式智能体：从单机到集群的跨越
 
@@ -199,6 +234,69 @@ Agent Provider (本地Agent) ────▶ Nacos Registry ◀──── Agen
         │◀─────────────────────────────────────────────────────│
 ```
 
+### 4.4 A2A客户端与服务器代码示例
+
+**服务端：暴露ReactAgent为A2A服务**
+```java
+@Configuration
+public class A2AServerConfig {
+    @Bean
+    public ReactAgent weatherAgent(ChatModel chatModel, WeatherTool weatherTool) {
+        return ReactAgent.builder()
+            .name("weather-agent")
+            .model(chatModel)
+            .tools(weatherTool)
+            .instruction("你是天气助手，可以查询天气。")
+            .build();
+    }
+    
+    @Bean
+    public A2AServer a2aServer(ReactAgent weatherAgent, NacosRegistry registry) {
+        // 构建AgentCard
+        AgentCard card = AgentCard.builder()
+            .name("weather-agent")
+            .description("提供天气查询服务")
+            .url("http://localhost:8080/a2a/message")
+            .build();
+        // 注册到Nacos
+        registry.register(card);
+        // 启动A2A Server（以下为示意，实际API请参考官方）
+        return new A2AServer(weatherAgent, card);
+    }
+}
+```
+
+**客户端：通过A2A调用远程Agent**
+```java
+@Service
+public class WeatherClientService {
+    @Autowired
+    private NacosDiscovery discovery;
+    
+    public String callRemoteWeatherAgent(String city) {
+        // 发现远程Agent
+        AgentCard remoteCard = discovery.discover("weather-agent");
+        // 创建A2A客户端
+        A2AClient client = new A2AClient(remoteCard.getUrl());
+        // 发送任务
+        Task task = client.sendTask(new Message("user", "查询" + city + "天气"));
+        // 轮询任务状态（异步任务场景）
+        while (task.getStatus() != TaskStatus.COMPLETED) {
+            Thread.sleep(1000);
+            task = client.getTask(task.getId());
+        }
+        return task.getResult();
+    }
+}
+```
+
+### 4.5 分布式一致性考量
+
+A2A协议中的Task状态管理在多节点场景下需注意：
+- **Task ID幂等性**：客户端应生成唯一ID（如UUID），服务端需按ID去重，防止重复执行。
+- **状态同步**：若Task由Agent A创建，Agent B查询状态，需共享存储（Redis/DB）。Spring AI Alibaba未内置，可自行实现`TaskStateRepository`接口。
+- **网络分区处理**：建议设置合理的超时（如30s）和重试策略（指数退避）。
+- **A2A任务结果获取模式**：A2A协议支持两种模式——①**Poll模式**：客户端创建Task后定期调用`getTask(taskId)`轮询状态；②**Push模式**：客户端提供Webhook URL，服务端任务完成后主动回调。生产环境推荐Push模式以降低延迟和轮询开销。
 
 ## 五、指挥官模式：从无序协作到有序调度
 
@@ -215,6 +313,18 @@ Agent Provider (本地Agent) ────▶ Nacos Registry ◀──── Agen
 
 指挥官模式将拓扑结构从“网状”变为 **“星型”** ：
 
+```mermaid
+graph TD
+    User[用户] --> Commander[Commander Agent<br/>大脑/调度中枢]
+    Commander -->|分发任务| Worker1[Worker Agent A]
+    Commander -->|分发任务| Worker2[Worker Agent B]
+    Commander -->|分发任务| Worker3[Worker Agent C]
+    Worker1 -->|返回结果| Commander
+    Worker2 -->|返回结果| Commander
+    Worker3 -->|返回结果| Commander
+    Commander -->|最终输出| User
+```
+
 - **Commander（大脑）** ：核心调度中枢，维护全局状态，拥有上帝视角，不负责具体搬砖，只负责“拆解任务、指派工单、验收结果”
 - **Worker（工具）** ：具备特定技能的Agent
 - **User**：发起自然语言指令
@@ -225,7 +335,6 @@ Agent Provider (本地Agent) ────▶ Nacos Registry ◀──── Agen
 3. 分发：判断需要的Worker并生成调用参数
 4. 执行与反馈：Worker执行任务，返回结果给Commander
 5. 决策：检查结果是否满足目标？满足则输出，不满足则修正计划继续分发
-
 
 ## 六、生产级问题分类与解决方案
 
@@ -266,19 +375,45 @@ Agent Provider (本地Agent) ────▶ Nacos Registry ◀──── Agen
 - **工具治理**：标准化工具接入（MCP）、熔断降级机制
 - **安全边界**：权限隔离、数据脱敏
 
+**预算与熔断配置示例**（注意：以下API可能随版本变化，请以官方文档为准）：
+```java
+ReactAgent agent = ReactAgent.builder()
+    .name("safe-agent")
+    .model(chatModel)
+    .costBudget(CostBudget.builder()
+        .maxTotalToken(5000)      // 单次调用最多5000 token
+        .maxToolCalls(10)         // 最多调用10次工具
+        .build())
+    .circuitBreaker(CircuitBreaker.ofDefaults("agent-cb"))  // 使用Resilience4j
+    .build();
+```
+
+**可观测性集成示例**（Micrometer Tracing）：
+```java
+// 在Agent执行时自动创建Span
+Observation observation = Observation.createNotStarted("agent.call", registry)
+    .lowCardinalityKeyValue("agent.name", agent.getName())
+    .start();
+try {
+    result = agent.call(input);
+} finally {
+    observation.stop();
+}
+// 导出到Jaeger或Zipkin
+```
 
 ## 七、调优与最佳实践
 
 ### 7.1 架构选型决策树
 
-| 场景 | 推荐模式 | 理由 |
-|------|---------|------|
-| 简单任务、工具数量少 | 单ReactAgent | 开销最小，响应最快 |
-| 任务步骤明确、确定性高 | SequentialAgent | 流水线串行，简单可控 |
-| 需要多角度评估、结果融合 | ParallelAgent | 并发执行，效率高 |
-| 意图多样、需动态路由 | LlmRoutingAgent | 按需分发，灵活适配 |
-| 需要全局统筹、避免失控 | 指挥官模式 | 中心化控制，可控可审计 |
-| Agent数量多、跨团队 | A2A分布式 | 服务化治理，按域独立部署 |
+| 场景 | 推荐模式 | 理由 | 反模式 |
+|------|---------|------|--------|
+| 简单任务、工具数量少 | 单ReactAgent | 开销最小，响应最快 | 强行拆分为多Agent增加复杂度 |
+| 任务步骤明确、确定性高 | SequentialAgent | 流水线串行，简单可控 | 步骤间有循环依赖 |
+| 需要多角度评估、结果融合 | ParallelAgent | 并发执行，效率高 | 任务间需顺序依赖 |
+| 意图多样、需动态路由 | LlmRoutingAgent | 按需分发，灵活适配 | 路由规则需精确而非LLM判断 |
+| 需要全局统筹、避免失控 | 指挥官模式 | 中心化控制，可控可审计 | Agent数量过多（>10）导致Commander成为瓶颈 |
+| Agent数量多、跨团队 | A2A分布式 | 服务化治理，按域独立部署 | 任务间强一致性要求极高 |
 
 ### 7.2 上下文工程最佳实践
 
@@ -301,29 +436,29 @@ Spring AI Alibaba Admin提供Prompt管理、数据集管理、评估器管理、
 
 ### 7.5 安全与合规
 
-- **数据脱敏**：敏感信息在进入Agent前脱敏
-- **审计日志**：记录Agent调用的完整操作历史
-- **权限隔离**：通过A2A分布式部署实现Agent间的数据隔离
-- **输入输出验证**：对大模型输出进行格式验证和内容过滤
+- **数据脱敏**：敏感信息在进入Agent前脱敏。示例：使用自定义`SensitiveDataFilter`。
+- **审计日志**：记录Agent调用的完整操作历史。
+- **权限隔离**：通过A2A分布式部署实现Agent间的数据隔离。
+- **输入输出验证**：对大模型输出进行格式验证和内容过滤。
+- **A2A通信安全**：除JWS签名外，建议启用TLS（HTTPS）传输加密，并使用JWE对消息负载进行端到端加密。实现RBAC可基于OAuth 2.1 Client Credentials流程，在A2A请求头中携带Bearer Token。
 
+**A2A通信安全示例**：
+- **TLS配置**：在Spring Boot中设置`server.ssl.enabled=true`并配置证书。
+- **JWE加密**：使用Nimbus JOSE + JWT库对A2A消息负载加密。
+- **OAuth 2.1客户端凭证**：
+```java
+// A2A客户端添加Bearer Token
+webClient.post()
+    .uri(agentUrl)
+    .header("Authorization", "Bearer " + accessToken)
+    .bodyValue(taskRequest);
+```
 
 ## 八、A2A协议与MCP的关系再深化
 
-在2026年的AI Agent生态中，A2A协议与MCP协议已形成清晰的**分工互补**格局：
+（本章已合并至第二章2.4节）
 
-| 维度 | MCP（Model Context Protocol） | A2A（Agent2Agent Protocol） |
-|------|------------------------------|----------------------------|
-| **目的** | 模型↔工具接口 | 代理↔代理接口 |
-| **关注焦点** | 工具访问、上下文连接 | 发现、委派、协作 |
-| **标准化主体** | Anthropic → Linux Foundation（2025年12月） | Google → Linux Foundation（2025年6月） |
-| **当前版本** | 持续演进 | 1.0规范 + A2A Java SDK 1.0.0.Alpha1（2026年1月） |
-| **关键概念** | Tool、Resource、Server | AgentCard、Task、AgentSkill |
-| **通信方式** | JSON-RPC over HTTP/WebSocket | HTTP/SSE、JSON-RPC |
-
-MCP与A2A一同归入LF AI & Data管理。两者相互配合，由MCP处理纵向（模型到工具）集成，A2A处理横向（代理到代理）编排，共同构成完整的AI Agent通信栈。
-
-> **关于ACP**：IBM的Agent Communication Protocol（ACP）已正式并入A2A协议，ACP的开发已逐步停止，新项目应直接使用A2A。
-
+> 详见第二章第2.4节。
 
 ## 九、Spring AI Alibaba 1.1.2.0核心特性总览
 
@@ -336,8 +471,7 @@ Spring AI Alibaba 1.1.2.0正式版（2026年2月发布）核心升级方向：
 5. **Sandbox & Studio**：安全沙箱模块与内置RenderTemplate
 6. **Admin/UI与文档更新**
 
-**后续版本信息**：GitHub最后发布版本为v1.1.2.2（2026年3月10日），持续迭代中。
-
+**后续版本信息**：GitHub最后发布版本为v1.1.2.2（2026年3月10日），持续迭代中。**请用户自行查阅最新版本**。
 
 ## 十、总结：核心技术图谱
 
@@ -354,21 +488,19 @@ Spring AI Alibaba 1.1.2.0正式版（2026年2月发布）核心升级方向：
 
 **一句话核心记忆**：多智能体技术栈 = **MAS架构（组织设计） + A2A协议（通信标准） + Agent Skills（知识调度） + MCP（工具标准化） + Spring AI Alibaba（工程实现） + 生产Harness（运维保障）** ，六者有机协同，构成从理论到生产落地的完整路径。
 
-
 ## 十一、时效性与版本提醒
 
 本文基于以下版本和背景撰写：
-- **Spring AI Alibaba**：基于**1.1.2.0正式版**（2026年2月发布），最后发布版本为v1.1.2.2（2026年3月）
-- **A2A协议**：基于Linux Foundation统一技术路线，A2A 1.0规范已发布，A2A Java SDK 1.0.0.Alpha1于2026年1月发布，协议关键决策由八家企业代表组成的TSC负责
+- **Spring AI Alibaba**：基于**1.1.2.0正式版**（2026年2月发布），最后发布版本为v1.1.2.2（2026年3月）。**截至2026年6月中旬，请访问GitHub确认是否有1.2.x或更高版本**。GitHub: https://github.com/alibaba/spring-ai-alibaba
+- **A2A协议**：基于Linux Foundation统一技术路线，A2A 1.0规范已发布，A2A Java SDK 1.0.0.Alpha1于2026年1月发布。**正式版状态请查阅A2A GitHub**: https://github.com/lf-ai-data/a2a-java-sdk
 - **MCP**：2025年12月捐赠给Linux Foundation Agentic AI Foundation（AAIF）
 - **ACP**：2025年8月并入A2A
 
 相关技术和API仍在快速演进，请以官方文档和源代码仓库的最新内容为准。
 
-
 ## 附录：交互实践快速参考
 
-### A1. 单Agent最小实践
+### A1. 单Agent最小实践（含超时与重试）
 
 ```java
 @Configuration
@@ -382,6 +514,12 @@ public class MinimalAgentConfig {
             .build();
     }
 }
+
+// 调用时添加超时和重试
+ReactorResult result = agent.call(input)
+    .timeout(Duration.ofSeconds(30))
+    .retryWhen(Retry.backoff(3, Duration.ofSeconds(1)))
+    .block();
 ```
 
 ### A2. 工具集成实践
@@ -411,10 +549,13 @@ ReactAgent agent = ReactAgent.builder()
     .saver(new MemorySaver())
     .hooks(List.of(hook))
     .build();
+// Agent会在需要时自动调用read_skill，无需手动调用
 agent.call("请介绍你有哪些技能");
 ```
 
-### A4. 环境变量清单
+### A4. A2A客户端完整示例（见第四章4.4节）
+
+### A5. 环境变量清单
 
 | 变量名                    | 用途              | 必填    |
 | ---------------------- | --------------- | ----- |
