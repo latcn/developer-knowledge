@@ -1,4 +1,4 @@
-> **版本**：v6.3  
+
 > **最后更新**：2026-06-12  
 > **适用框架**：Spring AI Alibaba 1.1.2+、Nacos 3.1.0+、Apache RocketMQ 5.2+
 
