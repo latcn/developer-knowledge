@@ -194,13 +194,15 @@ POP 模式下，一条消息从被领取到完成消费的完整路径：
 
 #### 6.3 并发处理同一队列：核心机制
 
-POP 模式允许**多个消费者并发处理同一队列上的消息**。Broker 在处理 POP 请求时会获取队列锁（通过 `lock consumer queue` 实现），以确保同一时刻只有一个消费者能成功获得锁并拉取消息。**补充**：该锁仅保护**拉取操作**（将一批消息标记为不可见并返回给消费者），持锁时间极短（毫秒级）。多个消费者可以快速轮换获得锁，各自拉取不同的消息批次，从而实现高并发。因此，锁的存在并不会成为性能瓶颈。
+POP 模式允许**多个消费者并发处理同一队列上的消息**。Broker 在处理 POP 请求时，会短暂获取队列锁以原子性地执行“拉取消息并标记为不可见”操作，持锁时间极短（毫秒级），随后立即释放。
+
+POP 模式的真正并发能力来源于 Broker 端精确的“已投递但未完成”状态管理——Broker 可以同时跟踪同一队列上多条被不同消费者领走、但尚未最终确认的消息，并通过长轮询机制协调多个消费者的并发拉取请求。多个消费者并非简单“轮换获得锁”，而是在 Broker 的协调下，各自并发处理不同批次的**不同消息**。POP 模式将负载均衡和位点管理从客户端迁移到 Broker 端，正是为了解决传统 Push 模式下客户端锁竞争和分配不均的问题。
 
 关键区别在于：
-- **传统 Push 模式**：一个队列在同一时刻稳定分配给一个消费者；
-- **POP 模式**：一个队列中的**不同消息**可以被不同消费者领走，Broker 追踪每一条“已投递但未完成”的消息状态。
+- **传统 Push 模式**：一个队列在同一时刻稳定分配给一个消费者
+- **POP 模式**：一个队列中的**不同消息**可以被不同消费者领走，Broker 追踪每一条“已投递但未完成”的消息状态
 
-POP 的核心创新在于：Broker 可以同时跟踪同一队列上多条“已经投递、但尚未最终完成”的消息。这正是 POP 能支撑更高消费并发的关键。
+> **关于锁竞争**：多个消费者同时拉取消息时，Broker 队列锁的竞争程度与消费者数量呈正相关。因此，POP 模式下消费者数量需要合理控制，不宜过度扩张。但这属于 POP 模式的固有特性，Broker 通过精细的状态管理已经在最大程度上优化了这一过程。
 
 #### 6.4 POP 状态存储优化：RocksDB 方案（RIP-73）
 
@@ -230,7 +232,7 @@ POP 模式在实践中的挑战在于“投递记录”数量巨大时的状态�
 
 **第一性原理验证**：会话状态管理的本质是“会话状态需要在多个应用服务器节点间共享”。LiteTopic 作为可靠的持久化消息通道，天然实现了这种共享，而不需要在应用服务器之间做复杂的状态同步。
 
-#### 7.2 场景二：细粒度任务隔离与限流（修正版）
+#### 7.2 场景二：细粒度任务隔离与限流
 
 **场景描述**：在 AI 推理平台中，需要为每个用户或每个模型 ID 设置独立的限流策略，同时避免一个用户的限流影响其他用户。
 
@@ -500,12 +502,15 @@ consumer.subscribe(PARENT_TOPIC, MessageSelector.bySql("liteTopic like 'user_%'"
 | 参数 | 说明 | 建议值/约束 |
 |------|------|------------|
 | `instanceName` | 客户端实例名称，确保同一进程内不同消费者的 ClientId 唯一性 | `String.valueOf(System.nanoTime())` |
-| `setConsumeThreadMin/ Max` | 消费线程池最小/最大线程数 | 根据 CPU 核数设置，通常 Min=10, Max=30 |
+| `setConsumeThreadMin(int)` | 消费线程池最小线程数 | 根据 CPU 核数设置，通常 Min=10 |
+| `setConsumeThreadMax(int)` | 消费线程池最大线程数（注：线程池使用无界队列，实际最大线程数受系统资源限制） | 通常 Max=30 |
 | `setPullBatchSize` | 单次拉取消息的最大条数（**非POP模式有效**，POP模式请用 `setPopBatchSize`） | 默认 32，根据消息体大小调整 |
 | `setConsumeMessageBatchMaxSize` | 批量消费时单批次最多消息数（**非POP模式有效**） | 默认 1，批量消费时可调整至 8-32 |
 | `setSuspendCurrentQueueTimeMillis` | 消费失败时挂起队列的时间（毫秒） | 默认 1000 |
 | 父 Topic 队列数 | 父 Topic 的队列数量决定可同时存活的 LiteTopic 上限 | 应 ≥ 预期的最大 LiteTopic 数量 |
 | LiteTopic 订阅上限 | 单消费者可有效处理的 LiteTopic 数量 | 千量级（超过可能性能下降） |
+
+> **线程池配置说明**：`consumeThreadMax` 参数设定的最大线程数在 RocketMQ 的默认线程池配置（无界队列）下可能不会严格生效，实际最大线程数由系统资源和队列大小共同决定。如需精确控制并发度，应合理设置 `consumeThreadMin` 并监控实际线程数。
 
 **通用客户端参数**（适用于生产者和消费者）：
 
@@ -589,7 +594,9 @@ public class PopPushConsumer {
         consumer.setPopInvisibleTime(30000);  // 30秒
         // 3. 设置 POP 批量拉取条数（可选，默认 8）
         consumer.setPopBatchSize(16);
-        // 4. 确保 instanceName 唯一
+        // 4. 设置批量消费条数，POP模式下建议设置为1，避免单批处理时间过长
+        consumer.setConsumeMessageBatchMaxSize(1);
+        // 5. 确保 instanceName 唯一
         consumer.setInstanceName(String.valueOf(System.nanoTime()));
 
         consumer.registerMessageListener(new MessageListenerConcurrently() {
@@ -597,25 +604,35 @@ public class PopPushConsumer {
             public ConsumeConcurrentlyStatus consumeMessage(
                     List<MessageExt> msgs, ConsumeConcurrentlyContext context) {
                 for (MessageExt msg : msgs) {
-                    try {
-                        // 处理业务，可能耗时较长
-                        processBusiness(msg);
-                    } catch (NeedMoreTimeException e) {
-                        // 业务处理需要更多时间，进行续租
+                    long startTime = System.currentTimeMillis();
+                    long invisibleTime = consumer.getPopInvisibleTime();
+                    
+                    while (true) {
                         try {
-                            // 续租30秒，延长消息的不可见期
-                            consumer.changeInvisibleTime(msg, 30000);
-                            // 续租成功后，继续处理消息（例如重试处理逻辑）
-                            // 注意：不建议直接返回 RECONSUME_LATER，因为那会导致消息重新投递
-                            // 正确的做法是：重新尝试处理业务，或采用异步处理并手动确认
-                            // 此处为简化示例，实际应用中应设计重试机制或异步回调
-                            return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
-                        } catch (Exception ex) {
-                            // 续租失败，返回重试
+                            // 执行实际业务逻辑
+                            processBusiness(msg);
+                            break;  // 业务成功完成，跳出重试循环
+                        } catch (NeedMoreTimeException e) {
+                            // 检查是否还有时间窗口可续租
+                            long elapsed = System.currentTimeMillis() - startTime;
+                            if (elapsed >= invisibleTime) {
+                                // 已无时间续租，返回重试让消息重新投递
+                                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+                            }
+                            
+                            try {
+                                // 续租，延长不可见期
+                                // ⚠️ 重要：changeInvisibleTime 仅延长不可见期，不能替代 ACK
+                                consumer.changeInvisibleTime(msg, invisibleTime);
+                                // 续租成功后，继续循环，重新执行业务逻辑
+                            } catch (Exception ex) {
+                                // 续租失败，返回重试
+                                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+                            }
+                        } catch (Exception e) {
+                            // 业务其他异常，返回重试
                             return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                         }
-                    } catch (Exception e) {
-                        return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                     }
                 }
                 return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
@@ -633,8 +650,28 @@ public class PopPushConsumer {
 ```
 
 > **续租逻辑说明**：  
-> 当业务处理时间可能超过 `popInvisibleTime` 时，应调用 `changeInvisibleTime` 延长不可见期，然后**继续处理消息**，而不是返回 `RECONSUME_LATER`（后者会导致消息重新入队，引发重复消费）。  
-> 实际生产建议使用**状态机+异步确认**模式，或者将长时任务拆分为多个阶段。上述示例仅为演示API用法，完整实现需根据业务设计合理重试与续租策略。
+> 当业务处理时间可能超过 `popInvisibleTime` 时，应调用 `changeInvisibleTime` 延长不可见期，然后**返回 `RECONSUME_LATER`**，让消息稍后重新进入消费队列，而不是错误地返回 `CONSUME_SUCCESS`。`changeInvisibleTime` 仅延长不可见期，不能替代 ACK。实际生产建议使用**状态机+异步确认**模式，或者将长时任务拆分为多个阶段。上述示例仅为演示API用法，完整实现需根据业务设计合理重试与续租策略。
+
+**⚠️ POP 模式下的批量消费配置注意事项**
+
+在 POP 模式下，有两个核心配置需要特别注意：
+- `setPopBatchSize(int)`：单次从 Broker 拉取的消息条数上限（默认 8）
+- `setConsumeMessageBatchMaxSize(int)`：单次回调中传入的消息列表最大长度（默认 1）
+
+**推荐配置**：由于 POP 模式下的 `invisibleTime` 从拉取时开始计时，单次回调处理多条消息会累积处理时间，极易触发超时导致消息被 Revive 重新投递。建议将 `consumeMessageBatchMaxSize` 设置为 1，或确保单批总处理时间远小于 `invisibleTime`。
+
+```java
+consumer.setPopBatchSize(8);                          // 一次拉取 8 条
+consumer.setConsumeMessageBatchMaxSize(1);            // 一次处理 1 条
+consumer.setPopInvisibleTime(P99处理时间 * 2);        // 留有足够余量
+```
+
+**如果必须使用批量消费**：
+- 确保 `consumeMessageBatchMaxSize` ≤ `popBatchSize`
+- 单批消息总处理时间 ≤ 0.7 × `invisibleTime`（预留续租窗口）
+- 在消息处理循环内，每处理完一条消息就调用 `changeInvisibleTime` 续租，防止整批超时
+
+`consumeMessageBatchMaxSize` 的最大值为 32，建议慎重调大。
 
 **POP 模式消费者核心配置参数**：
 
