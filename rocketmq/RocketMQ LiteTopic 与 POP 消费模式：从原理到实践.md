@@ -39,7 +39,7 @@
 > - **逻辑视图**：在用户视角，一个 LiteTopic 表现为一个独立的逻辑队列，拥有独立的消费位点和管理语义。
 > - **物理视图**：RocketMQ 的核心存储原理是 **CommitLog 优先** —— **所有 Topic（包括普通 Topic 和 LiteTopic）的消息体都物理存储在 CommitLog 中**。LiteTopic 的特殊性在于它复用父 Topic 的物理存储资源（CommitLog 和文件句柄），但在逻辑队列 ID（ConsumeQueue 索引）层面进行隔离。
 
-当 Topic 类型设置为 Lite 类型时，每个存储容器默认由一个队列组成。Topic 下可以创建百万量级的 LiteTopic。
+当 Topic 类型设置为 Lite 类型时，Topic 下可以创建百万量级的 LiteTopic，每个 LiteTopic 在用户语义层面**默认由一个队列组成**。
 
 #### 2.4 LiteTopic 最核心的设计思想
 
@@ -50,7 +50,7 @@ LiteTopic 基于 RocketMQ 业界领先的百万队列核心技术构建，其底
 
 **基柱二：自动化的全生命周期管理**
 LiteTopic 支持三个层面的自动化：
-1. **自动创建**：当用户对 message 进行了 `setLiteTopic`，如对应的轻量主题不存在，系统会自动创建。⚠️ **注意**：自动创建主要由**生产者（Producer）发送消息**时触发；消费者订阅一个不存在的 LiteTopic 通常不会触发自动创建。此外，自动创建依赖 Broker 配置 `autoCreateTopicEnable=true` 以及父 Topic 路由信息已知。发送或订阅时 LiteTopic 自动创建，过期无新消息后自动删除，无需手动维护资源创建与回收；
+1. **自动创建**：发送消息时如果 LiteTopic 不存在，系统自动创建。⚠️ **注意**：自动创建主要由**生产者（Producer）发送消息**时触发；消费者订阅一个不存在的 LiteTopic 通常不会触发自动创建。此外，自动创建依赖 Broker 配置 `autoCreateTopicEnable=true` 以及父 Topic 路由信息已知。
 2. **自动删除**：设置 `expiration`（过期时间）后，距离最近一次消息写入超过该时间即自动删除；
 3. **无需预创建**：LiteTopic 无需预先创建，消息写入时按需自动生成，不影响发送耗时。
 
@@ -85,7 +85,7 @@ LiteTopic 的存储架构遵循 RocketMQ 的核心存储模型：
 
 - **CommitLog**：所有 Topic（包括普通 Topic 和 LiteTopic）的消息体**物理上顺序写入同一个 CommitLog 文件**，这是 RocketMQ 高性能写入的核心。
 - **ConsumeQueue（逻辑索引）**：每个 LiteTopic 拥有独立的 ConsumeQueue 文件，用于记录消息在 CommitLog 中的物理偏移量。这些逻辑队列在索引层面相互隔离。
-- **父 Topic**：作为 LiteTopic 的命名空间和组织单元，父 Topic 的 `writeQueueNums` 决定了可分配的逻辑队列 ID 总数。
+- **父 Topic**：作为 LiteTopic 的命名空间和组织单元。
 
 > **澄清**：LiteTopic **并非独立存储消息体**，而是复用父 Topic 的 CommitLog 物理存储资源，仅在逻辑队列层面进行隔离。这种设计既保证了极低的元数据开销（无需创建大量物理文件），又实现了消费位的独立管理。
 
@@ -138,7 +138,7 @@ consumer.subscribe(PARENT_TOPIC, MessageSelector.bySql("liteTopic like 'user_%'"
 | **动态订阅** | 支持通过过滤表达式动态筛选 | 不支持动态变更 |
 | **单个消费者订阅上限** | 可有效处理千量级的 LiteTopic | 订阅数量受限于 Topic 数量 |
 
-**关键洞察**：LiteTopic 在“资源隔离”和“订阅灵活性”两个维度上带来了质变——订阅关系中的父 Topic 固定，但可以通过过滤器灵活选择 LiteTopic 子集。
+**关键洞察**：LiteTopic 在“资源隔离”和“订阅灵活性”两个维度上带来了质变——订阅关系中的父 Topic 固定，但可以通过过滤器灵活选择 LiteTopic 子集。父 Topic 的队列数决定底层物理存储的并行度，但并不限制 LiteTopic 的数量——你可以在只有 4 个队列的父 Topic 下创建 100 万个 LiteTopic，因为 LiteTopic 是逻辑上的隔离，它们复用父 Topic 的物理队列。总 TPS 的上限可以根据 LiteTopic 数量的增加而增加。
 
 
 ## 第二部分：POP 消费模式 —— 消息粒度的负载均衡
@@ -227,21 +227,26 @@ POP 模式允许**多个消费者并发处理同一队列上的消息**。Broker
 
 > **关于锁竞争的优化机制**：
 > 
-> 在 RocketMQ 5.3.2+ 版本中，解决 POP 模式下队列锁（QueueLock）竞争的核心方案是引入了**排队（Queuing）机制**。
-> - **传统方式**：当队列锁被占用时，后续请求会直接失败或进行忙等（spin-wait），导致惊群效应（thundering herd）和线程饥饿问题。
-> - **排队机制**：在 `PopMessageProcessor` 中，当队列锁被占用时，请求不再直接失败或忙等，而是被放入一个等待队列（WaitQueue），由锁释放事件触发唤醒。这种机制将“竞争”转化为“有序排队”，从根本上解决了惊群效应和线程饥饿问题。
-> - **核心机制**：解决锁竞争的核心是**排队（Queuing）**，而解决流控和 CPU 空转的核心是**异步挂起与唤醒机制**——当 POP 请求到来时，如果没有可用消息或锁被占用，Processor 会将请求挂起（Suspend），而不是不断轮询。这是基于 Netty 的异步处理能力，而非传统的长轮询。
+> 在 RocketMQ 5.3.2+ 版本中，解决 POP 模式下队列锁（QueueLock）竞争的核心方案是**通过优化队列锁的粒度和引入等待队列，显著降低了锁竞争**。
+> - **具体优化**：通过优化 `PopBuffer` 的数据结构，减少了临界区的范围；当队列锁被占用时，请求不再直接失败或忙等，而是被放入等待队列（WaitQueue），由锁释放事件触发唤醒。
+> - 单纯的排队（FIFO）虽然解决了惊群效应，但会降低吞吐量。新版本实际上通过**优化 PopBuffer 的数据结构，减少了临界区的范围**，这才是并发性能提升的关键。
 
 #### 6.4 POP 状态存储优化：RocksDB 方案（RIP-73）
 
-RIP-73 提出的基于 RocksDB 的 POP 状态存储，在 RocketMQ 5.3.2+ 版本中已逐步成熟。**截至 2026 年，主流生产环境（5.5.0+ / 6.0+）中，基于 RocksDB 的 POP 状态存储已成为默认标配能力**，后续版本可能进一步被更高效的引擎（如基于 Raft 的元数据存储）优化。
+RIP-73 提出的基于 RocksDB 的 POP 状态存储，在 RocketMQ 5.3.2+ 版本中已逐步成熟。**截至 2026 年，主流生产环境（5.5.0+ / 6.0+）中，基于 RocksDB 的 POP 状态存储已成为默认标配能力**。
 
 **核心优势**：
 - 不依赖定时消息，代码量大幅缩减
 - 解决旧版基于 CommitLog 存储带来的磁盘占用高和读放大问题
 - 性能提升显著，社区基准测试推荐在高并发 POP 场景下默认开启
 
-**配置方式**：在 `broker.conf` 中设置 `popStorageMode=rocksdb`（或相关开关）。
+**配置方式**：启用 RocksDB 版的 POP 消费模式涉及多个配置参数。**建议直接参考 Apache RocketMQ 官方 Release Notes 中 "POP Storage Upgrade" 部分**，或查阅对应版本（如 5.3.2+）的官方文档中关于 RocksDB 存储的完整配置项说明broker.conf。
+```
+enablePopLog=true 
+popStorageMode=rocksdb 
+rocksDbWriteBufferSize=64MB 
+rocksDbMaxWriteBufferNumber=4
+```
 
 
 ## 第三部分：生产实践与最佳实践
@@ -266,12 +271,14 @@ RIP-73 提出的基于 RocksDB 的 POP 状态存储，在 RocketMQ 5.3.2+ 版本
 
 **场景描述**：在 AI 推理平台中，需要为每个用户或每个模型 ID 设置独立的限流策略，同时避免一个用户的限流影响其他用户。
 
-**解决方案**：为每个用户 ID 或模型 ID 创建独立的 LiteTopic，消费者统一订阅父 Topic。限流时，消费端可通过返回 `RECONSUME_LATER`（普通 Push）或 `Suspend`（POP 模式），并配合业务层维护的限流标记（如内存黑名单或 Redis 状态），实现**对该 LiteTopic 中的消息逐一延迟重试**的效果，但并非原子级的队列挂起。如需更精确的限流（例如暂停整个 LiteTopic 一段时间），建议在业务层实现滑动窗口或令牌桶算法，结合 `RECONSUME_LATER` 使用。
+**解决方案**：为每个用户 ID 或模型 ID 创建独立的 LiteTopic，消费者统一订阅父 Topic。限流时，消费端可通过返回 `RECONSUME_LATER`（普通 Push）或使用**挂起（Suspend）机制**（POP 模式），并配合业务层维护的限流标记实现精确限流。
+
+**POP 模式下更优雅的限流方式**：
+- **推荐**：使用 `context.setSuspendCurrentQueueTimeMillis(1000)` 让当前队列暂时停止分发，避免消息进入 Revive 流程，减少不必要的磁盘写入。
+- **备选**：返回 `RECONSUME_LATER` 会导致消息状态在 Broker 端发生变更（Revive），产生额外磁盘 IO。
 
 **核心优势**：
 - 基于 LiteTopic 的物理隔离，限流操作仅影响目标 LiteTopic，不干扰其他队列的正常消费。
-
-**实践数据**：基于 LiteTopic 的精细化流量治理方案，既能实现毫秒级的实时限流，又能支持分钟级的忙闲调度。
 
 #### 7.3 场景三：多 Agent 异步通信
 
@@ -314,10 +321,10 @@ POP 模式的并发能力来源于 Broker 侧的“处理中状态”管理—�
 
 **问题 1：POP 消费者锁竞争导致消费不均**
 - **现象**：部分消费者得不到消息，出现资源浪费。
-- **原因**：Broker 在 POP 时通过 Lock Consumer Queue 实现消息领取。多个 POP 消费者进行锁竞争的时间和 POP 消费者的个数成此起彼伏的形态。
+- **原因**：Broker 在 POP 时通过 Lock Consumer Queue 实现消息领取。多个 POP 消费者进行锁竞争的时间和消费者数量相关。
 - **解决方案**：
-  - **排队机制**：在 RocketMQ 5.3.2+ 版本中，当队列锁被占用时，请求不再直接失败或忙等，而是被放入一个等待队列（WaitQueue），由锁释放事件触发唤醒，从根本上解决了惊群效应。
-  - 合理控制消费者实例数量，升级到 5.3.2+ 版本以利用排队机制。
+  - 升级到 5.3.2+ 版本，利用**队列锁粒度优化和等待队列机制**显著缓解锁竞争。
+  - 合理控制消费者实例数量。
 
 **问题 2：POP 消息处理超时与重复消费**
 - **现象**：消息被多次消费，引起数据不一致。
@@ -346,7 +353,9 @@ POP 模式的并发能力来源于 Broker 侧的“处理中状态”管理—�
 
 #### 10.1 Java 客户端版本选择与环境准备
 
-RocketMQ LiteTopic 功能要求服务端版本 **5.5.0 及以上**（官方要求 5.5.0 版本及以上），客户端版本 **RocketMQ gRPC 5.1.0 版本及以上**。POP 模式要求服务端 5.0+，推荐 5.3.2+ 以启用 RocksDB 优化。
+RocketMQ LiteTopic 功能要求服务端版本 **5.5.0 及以上**，客户端版本 **RocketMQ gRPC 5.1.0 版本及以上**。POP 模式推荐使用 **5.3.2+ 或 6.0.0+** 版本以获得最佳性能和稳定性。
+
+⚠️ **版本建议**：生产环境中建议使用 **5.3.2** 或 **6.0.0 以上**版本。5.1.4 版本缺少后续版本中对 POP 性能的优化（如异步化改造）和安全补丁。
 
 Maven 依赖配置如下：
 
@@ -354,12 +363,12 @@ Maven 依赖配置如下：
 <dependency>
     <groupId>org.apache.rocketmq</groupId>
     <artifactId>rocketmq-client</artifactId>
-    <version>5.1.4</version>
+    <version>5.3.2</version>   <!-- 推荐 5.3.2 或更高版本 -->
 </dependency>
 <dependency>
     <groupId>org.apache.rocketmq</groupId>
     <artifactId>rocketmq-proxy</artifactId>
-    <version>5.1.4</version>
+    <version>5.3.2</version>
 </dependency>
 ```
 
@@ -454,9 +463,12 @@ public class LiteTopicConsumer {
                 for (MessageExt msg : msgs) {
                     String liteTopic = msg.getLiteTopic();
                     if (needRateLimit(liteTopic)) {
-                        // ⚠️ 注意：直接 sleep + RECONSUME_LATER 存在死循环风险
-                        // 建议配合指数退避策略或使用延迟重试
-                        // 示例：使用 Redis 记录重试次数，超过阈值则丢弃或走死信队列
+                        // ⚠️ POP 模式下更优雅的限流方式：
+                        // 使用挂起（Suspend）机制，让当前队列暂时停止分发
+                        // context.setSuspendCurrentQueueTimeMillis(1000);
+                        // return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+                        // 
+                        // 注意：返回 RECONSUME_LATER 会导致消息进入 Revive 流程，产生额外磁盘 IO
                         return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                     }
                     processMessage(msg);
@@ -475,10 +487,11 @@ public class LiteTopicConsumer {
 > 如果 `needRateLimit` 一直为真且没有退避策略，`RECONSUME_LATER` 会导致消息被无限次快速重试，引发 CPU 飙升或消息堆积。
 > 
 > **解决方案**：
+> - **POP 模式优先使用挂起机制**：使用 `context.setSuspendCurrentQueueTimeMillis(1000)` 让当前队列暂时停止分发，避免消息进入 Revive 流程。
 > - **使用指数退避重试**：在业务逻辑或重试 Topic 中配置延迟级别
 > - **利用重试次数限制**：通过 `maxReconsumeTimes` 参数限制最大重试次数，超出后消息进入死信队列（DLQ）
-> - **结合 Suspend（POP 模式）**：使用 `context.setSuspend(true)` 或返回 `PopStatus.SUSPEND` 挂起队列
 > - **示例**：在限流场景中，使用 Redis 存储重试计数 + 退避时间，避免无脑死循环
+> - 在限流场景的代码示例中，**优先展示 `Suspend` 的用法**，并将 `RECONSUME_LATER` 作为备选方案（例如在无法使用 Suspend 的旧版本中）。
 
 #### 10.5 动态筛选 LiteTopic
 
@@ -491,12 +504,10 @@ public class LiteTopicConsumer {
 |------|------|--------|
 | `instanceName` | 实例唯一标识 | `String.valueOf(System.nanoTime())` |
 | `setConsumeThreadMin(int)` | 核心线程数 | 10 |
-| `setConsumeThreadMax(int)` | 最大线程数（**有效参数**） | 30 |
+| `setConsumeThreadMax(int)` | 最大线程数 | 30 |
 | `setPullBatchSize` | 单次拉取条数（非POP） | 32 |
 | `setConsumeMessageBatchMaxSize` | 批量消费条数 | 默认 1。可调大至 8-32 以提升高吞吐场景性能，但必须确保单批总处理时间 ≤ 0.7 × `invisibleTime` |
 | `setSuspendCurrentQueueTimeMillis` | 失败挂起时间 | 1000 |
-
-> **线程池说明**：`setConsumeThreadMax` 有效。默认使用 `LinkedBlockingQueue`，当核心线程满且队列积压时，线程数会增长至 Max。
 
 #### 10.7 LiteTopic 与普通 Topic 的 Java API 差异对比
 
@@ -511,64 +522,51 @@ public class LiteTopicConsumer {
 
 POP 模式将负载均衡、消费位点管理等逻辑从客户端迁移至 Broker 端，使客户端轻量级化，并支持消息粒度的负载均衡。
 
-**启用 POP 模式需同时满足以下条件**：
-- 使用 Push Consumer API（非 Lite Pull 或 Pull）；
-- 开启 broker rebalance，由 broker 执行 queue 分配；
-- 非顺序消费（并发消费）；
-- 非广播消费（集群消费）。
+**启用 POP 模式的核心方式：通过 Broker 端命令开启，客户端无需额外配置**
 
-**启用 broker rebalance 的核心：** 在 RocketMQ 5.x 版本中，开启 broker rebalance 需要满足以下条件：
-- 使用 Push API（Lite pull 和 pull 都不支持）；
-- **关闭客户端 Rebalance**（`setClientRebalance(false)`）；
-- 非顺序消费（并发消费）；
-- 非广播消费（集群消费）。
+在 RocketMQ 5.5.0+ 及 6.0 版本中，标准做法是：客户端正常启动（保持默认配置），Broker 通过 `setConsumeMode` 命令下发 POP 策略，客户端会自动切换到由 Broker 驱动的 POP 模式。
 
-⚠️ 这是 **RocketMQ 5.0–5.4 版本的标准做法**。如果你的 RocketMQ 集群版本已经升级到 5.5+ 或 6.0+，请查阅对应版本的 Release Notes，验证是否仍需要手动关闭客户端 Rebalance。在部分新版本中，POP 模式可能已不需要显式设置 `setClientRebalance(false)`，而是由 Broker 端自动协调。
+```bash
+# 通过 mqadmin 命令为特定 Topic 和 ConsumerGroup 开启 POP 模式
+mqadmin setConsumeMode -b <brokerAddr> -t <topic> -g <consumer_group> -m POP -n 8
+```
+
+命令中的 `-n 8` 指定了 POP 模式下批量拉取的消息条数上限，该值应结合业务消息体大小和客户端处理能力综合设置（通常 8-32）。`setPopBatchSize`（或命令行的 `-n`）控制的是单次 RPC 请求从 Broker 获取的消息数。该参数不仅影响网络传输，还直接影响消费端的内存占用和处理延迟。
+`setPopBatchSize`建议根据消息体大小动态调整。对于 AI 大消息场景，建议将该值调低（如 **1-4**），并配合 `setConsumeMessageBatchMaxSize` 进行批量处理，避免单次网络传输过大。
+
+> **⚠️ 重要说明**：
+> - 在 RocketMQ 5.0–5.4 版本中，POP 模式的开启需要**同时满足**：关闭客户端 Rebalance（`setClientRebalance(false)`）+ 使用 Push Consumer API + 非顺序消费 + 非广播消费。这是早期版本的标准做法。
+> - **在 RocketMQ 5.5.0+ 及 6.0 版本中**，`setClientRebalance(false)` 这个配置**已经不再需要**。新版本引入了混合消费模式（Mixed Mode）和服务端协调器（Server-side Rebalancer），通过 `setConsumeMode` 命令即可下发 POP 策略，客户端会自动适配。如果在 5.5+ 版本强制设置 `setClientRebalance(false)`，可能会导致消费者无法正常加入消费者组，或无法接收 Broker 的重平衡指令。
+> - 请务必根据你使用的 RocketMQ 版本选择对应的配置方式。**强烈建议升级到 5.5.0+ 版本，并查阅对应版本的 Release Notes**。
 
 **Broker 端开启 POP 消费模式**：
 
-开启 POP 消费模式有以下两种方式：
-
-**方式一（推荐）：通过 mqadmin 命令为特定 Topic 和 ConsumerGroup 开启 POP 模式**
-
 ```bash
-# 为特定 topic 和 consumerGroup 开启 POP 消费模式，-n 指定 popBatchSize
+# 方式一（推荐）：通过 mqadmin 命令
 mqadmin setConsumeMode -b <brokerAddr> -t <topic> -g <consumer_group> -m POP -n 8
-# 或为整个 Cluster 开启（-c 代替 -b）
-mqadmin setConsumeMode -c <clusterName> -t <topic> -g <consumer_group> -m POP -n 8
-```
 
-命令中的 `-n 8` 指定了 POP 模式下批量拉取的消息条数上限，该值应结合业务消息体大小和客户端处理能力综合设置（通常 8-32）。
-
-**方式二：Broker 全局默认开启**
-
-在 Broker 配置文件 `broker.conf` 中添加以下配置，对所有 Topic 和 ConsumerGroup 全局开启 POP 模式。此方式优先级低于方式一，当方式一有配置时按方式一执行。
-
-```properties
+# 方式二：Broker 全局默认开启（配置文件 broker.conf）
 defaultMessageRequestMode=POP
 ```
 
-**完整的 POP 消费者 Java 示例（正确续租逻辑）**：
+**完整的 POP 消费者 Java 示例（正确续租逻辑 + 重试保护）**：
 
 ```java
 public class PopPushConsumer {
     private static final String CONSUMER_GROUP = "pop_consumer_group";
     private static final String TOPIC = "test-topic";
+    private static final int MAX_RETRY_TIMES = 3;
 
     public static void main(String[] args) throws Exception {
         DefaultMQPushConsumer consumer = new DefaultMQPushConsumer(CONSUMER_GROUP);
         consumer.setNamesrvAddr("localhost:9876");
         consumer.subscribe(TOPIC, "*");
-        // 1. 关闭客户端 Rebalance，由 Broker 负责分配
-        consumer.setClientRebalance(false);
-        // 2. 设置消息不可见时间（毫秒）
-        //    ⚠️ 消费处理时间必须小于此值，否则可能重复消费
-        consumer.setPopInvisibleTime(30000);  // 30秒
-        // 3. 设置 POP 批量拉取条数（可选，默认 8）
+        // 注意：5.5.0+ 版本不再需要 setClientRebalance(false)
+        // 如需兼容 5.0-5.4 版本，请根据实际情况添加：
+        // consumer.setClientRebalance(false);
+        consumer.setPopInvisibleTime(30000);
         consumer.setPopBatchSize(16);
-        // 4. 设置批量消费条数
         consumer.setConsumeMessageBatchMaxSize(1);
-        // 5. 确保 instanceName 唯一
         consumer.setInstanceName(String.valueOf(System.nanoTime()));
 
         consumer.registerMessageListener(new MessageListenerConcurrently() {
@@ -578,26 +576,30 @@ public class PopPushConsumer {
                 for (MessageExt msg : msgs) {
                     long startTime = System.currentTimeMillis();
                     long invisibleTime = consumer.getPopInvisibleTime();
+                    int retryCount = msg.getReconsumeTimes();
 
                     while (true) {
                         try {
                             processBusiness(msg);
-                            // 业务成功完成，返回 SUCCESS
-                            break;
+                            break;  // 业务成功
                         } catch (NeedMoreTimeException e) {
                             long elapsed = System.currentTimeMillis() - startTime;
-                            if (elapsed >= invisibleTime) {
-                                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+                            if (elapsed >= invisibleTime || retryCount >= MAX_RETRY_TIMES) {
+                                // 超过最大重试次数或已无时间续租
+                                // 建议记录日志告警，避免消息死循环
+                                System.err.println("Message processing failed after " + retryCount + " retries, msgId: " + msg.getMsgId());
+                                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS; // 跳过该消息
                             }
                             try {
-                                // ⚠️ 续租：仅延长 Broker 端的锁时间
                                 consumer.changeInvisibleTime(msg, invisibleTime);
-                                // ✅ 续租成功后继续循环执行业务
-                                // ❌ 绝不能返回 RECONSUME_LATER
                             } catch (Exception ex) {
                                 return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                             }
                         } catch (Exception e) {
+                            if (retryCount >= MAX_RETRY_TIMES) {
+                                System.err.println("Message processing failed after " + retryCount + " retries, msgId: " + msg.getMsgId());
+                                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+                            }
                             return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                         }
                     }
@@ -610,7 +612,7 @@ public class PopPushConsumer {
     }
 
     private static void processBusiness(MessageExt msg) throws NeedMoreTimeException {
-        // 业务逻辑，若时间不够则抛异常
+        // 业务逻辑
     }
 }
 ```
@@ -619,12 +621,14 @@ public class PopPushConsumer {
 > - `changeInvisibleTime` 只延长 Broker 端的锁时间，不确认消息。
 > - 续租成功后**必须继续在当前线程中处理业务**，最终返回 `CONSUME_SUCCESS`。
 > - 返回 `RECONSUME_LATER` 会导致消息立即重新投递，造成重复消费。
+> - **增加重试次数保护**：通过 `msg.getReconsumeTimes()` 判断重试次数，超过阈值后记录告警并跳过该消息，避免因永久性错误陷入死循环。
+> - 在续租失败时，应根据异常类型进行退避。如果是 `MQClientException`（网络类），建议捕获后不返回状态（继续循环，利用代码中的 `MAX_RETRY_TIMES` 控制），或者记录日志后等待下一次拉取；如果是业务异常，则按原逻辑处理。
 
 **POP 批量消费配置**：
 
 | 参数 | 默认值 | 调优建议 |
 |------|--------|----------|
-| `setPopBatchSize` | 8 | 8-32，根据消息大小调整 |
+| `setPopBatchSize` | 8 | 8-32，根据消息大小调整。该参数控制单次 RPC 请求从 Broker 获取的消息数，影响网络传输和消费端内存占用 |
 | `setConsumeMessageBatchMaxSize` | 1 | 默认 1。可调大至 8-32 以提升高吞吐场景性能，但必须确保单批总处理时间 ≤ 0.7 × `invisibleTime` |
 
 #### 10.9 POP 模式幂等消费实现建议
@@ -653,28 +657,26 @@ try {
 |------|----------|------|
 | LiteTopic 服务端 | 5.5.0+ | 官方要求 5.5.0 版本及以上 |
 | LiteTopic 客户端 | RocketMQ gRPC 5.1.0+ | 官方要求 5.1.0 版本及以上 |
-| POP 模式 | 5.0.0+ | RocketMQ 5.0 开始引入 |
-| POP + RocksDB | 5.3.2+（生产推荐） | 已成为默认标配能力 |
-| 推荐生产版本 | 5.5.0+（LiteTopic）；5.3.3+（POP） | 稳定性最佳 |
+| POP 模式 | 5.3.2+（生产推荐） | 推荐使用 5.3.2 或 6.0.0+ 版本 |
+| RocksDB 存储 | 5.3.2+（生产推荐） | 已成为默认标配能力 |
 
 **升级注意事项**：
-1. POP 模式下 `popInvisibleTime` 超时导致的重复消费问题（即使 `maxReconsumeTimes=0`），在 5.3.x 之前版本中存在逻辑缺陷，建议升级到 5.3.2 及以上。
-2. 5.3.1 及以下版本存在 RocksDB seek first API 性能瓶颈和偏移量重置问题，建议升级到 5.3.2 及以上。
-3. **LiteTopic 官方要求服务端 5.5.0 版本及以上**，客户端要求 RocketMQ gRPC 5.1.0 版本及以上。
-4. 若客户端版本低于 5.1.0，`setLiteTopic` API 可能不可用，请升级客户端。
-5. 在生产环境升级前，应在预发环境充分测试新版本的兼容性和性能表现。
-6. **RocksDB POP 存储**：在 `broker.conf` 中设置 `popStorageMode=rocksdb` 以启用生产推荐模式，社区基准测试表明该模式显著降低了磁盘占用和读放大。
+1. **版本选择**：生产环境推荐使用 **5.3.2** 或 **6.0.0 以上**版本，避免使用 5.1.4 等低版本。
+2. **POP 模式配置**：5.5.0+ 版本不再需要 `setClientRebalance(false)`，通过 `setConsumeMode` 命令即可开启 POP 模式。
+3. **RocksDB 存储**：启用 RocksDB 版的 POP 消费模式涉及多个配置参数，请参考 Apache RocketMQ 官方 Release Notes 中 "POP Storage Upgrade" 部分。
+4. **LiteTopic 版本**：官方要求服务端 5.5.0 版本及以上，客户端要求 RocketMQ gRPC 5.1.0 版本及以上。
 
 ### 第 11 章 调优参数与最佳实践
 
 #### 11.1 LiteTopic 核心配置参数
 
-| 参数 | 建议值 |
-|------|--------|
-| `message type` | Lite |
-| `expiration` | 30-720 分钟，默认 60 |
-| 命名规范 | `{业务类型}_{业务ID}` |
-| 父 Topic 队列数 | ≥ 最大预期 LiteTopic 数量 |
+| 参数             | 建议值                           |
+| -------------- | ----------------------------- |
+| `message type` | Lite                          |
+| `expiration`   | 30-720 分钟，默认 60               |
+| 命名规范           | `{业务类型}_{业务ID}`               |
+| 父 Topic 队列数    | **建议 8-16**，而非大于 LiteTopic 数量 |
+**虽然 8-16 个队列可以支持百万级 LiteTopic，但如果单个父 Topic 的总写入 TPS 预计超过 10万，建议将父 Topic 队列数设置为 32 或 64，以避免单个队列成为性能瓶颈**
 
 #### 11.2 POP 模式核心配置参数
 
@@ -687,18 +689,19 @@ try {
 #### 11.3 LiteTopic 最佳实践
 
 1. **命名规范与生命周期管理**：采用 `{业务类型}_{业务ID}`，设置合理的 `expiration`。
-2. **容量规划**：父 Topic 队列数 ≥ 预期 LiteTopic 数量。
+2. **容量规划**：父 Topic 队列数决定底层物理存储的并行度，一般建议 8-16 即可。**你可以在只有 4 个队列的父 Topic 下创建 100 万个 LiteTopic**，总 TPS 的上限可以根据 LiteTopic 数量的增加而增加。队列数量无需大于 LiteTopic 数量。
 3. **高可用设计**：无状态应用服务器，状态依赖 RocketMQ 持久化。
-4. **限流策略**：返回 `RECONSUME_LATER` + 业务限流算法，避免无脑死循环。
+4. **限流策略**：POP 模式下优先使用挂起（Suspend）机制，避免 `RECONSUME_LATER` 产生不必要的磁盘 IO。
 5. **监控**：消息堆积量、TPS 分布。
 
 #### 11.4 POP 模式最佳实践
 
 1. **不可见期调优**：根据业务 P99 设置，配合 `changeInvisibleTime` 动态续租。
-2. **消费者数量控制**：避免过度竞争，5.3.2+ 版本通过排队机制显著缓解锁竞争。
+2. **消费者数量控制**：避免过度竞争，5.3.2+ 版本通过队列锁粒度优化和等待队列机制显著缓解锁竞争。
 3. **幂等消费设计**：必须实现幂等处理。
 4. **消息过滤优化**：高过滤比（>90%）时用 Broker 端过滤，否则用业务层过滤。
-5. **版本选型**：5.3.2+ 并启用 RocksDB 存储，LiteTopic 推荐 5.5.0+。
+5. **版本选型**：使用 5.3.2+ 或 6.0.0+ 版本，启用 RocksDB 存储，LiteTopic 推荐 5.5.0+。
+6. **重试保护**：在续租逻辑中增加对重试次数的判断（`msg.getReconsumeTimes()`），避免因永久性错误陷入死循环。
 
 ### 第 12 章 结语
 
