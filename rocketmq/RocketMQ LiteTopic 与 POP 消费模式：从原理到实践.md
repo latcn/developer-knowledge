@@ -13,9 +13,8 @@
 
 传统 RocketMQ（4.x 及以前版本）在应对 AI 场景时暴露了两个核心痛点：
 
-**队列头部阻塞**：AI 推理任务耗时差异巨大（从几秒到几十分钟不等）。在多个用户共享队列的场景中，一条长耗时的消息占据队列头部后，会阻塞其后的所有消息，导致其他用户的正常请求无法被及时处理。
-
-**并发效率受损**：当需要限流时，传统方案通常采用 `Thread.sleep()` 阻塞消费者线程。这会导致一个严重后果：即使队列中还有其他用户的消息等待处理，由于消费线程全被限流用户的请求阻塞，这些正常消息也无法被处理。
+- **队列头部阻塞**：AI 推理任务耗时差异巨大（从几秒到几十分钟不等）。在多个用户共享队列的场景中，一条长耗时的消息占据队列头部后，会阻塞其后的所有消息，导致其他用户的正常请求无法被及时处理。
+- **并发效率受损**：当需要限流时，传统方案通常采用 `Thread.sleep()` 阻塞消费者线程。这会导致一个严重后果：即使队列中还有其他用户的消息等待处理，由于消费线程全被限流用户的请求阻塞，这些正常消息也无法被处理。
 
 ### 第 2 章 LiteTopic 核心概念：从第一性原理出发
 
@@ -34,9 +33,9 @@
 
 #### 2.3 LiteTopic 的基本定义
 
-**LiteTopic（轻量主题）** 是 Apache RocketMQ 中消息传输和存储的**二级容器**，用于标识同一类业务逻辑下不同子类的消息，位于父 Topic 之下，由「父 Topic + LiteTopic 名称」共同唯一确认消息的存储容器。
+**LiteTopic（轻量主题）** 是 Apache RocketMQ 中消息传输和存储的**二级容器**，用于标识同一类业务逻辑下不同子类（例如不同会话、任务等粒度）的消息。在 RocketMQ 的领域模型中：**Topic 是消息传输和存储的顶层容器。当类型为 Lite 类型时，Topic 下可创建轻量主题（LiteTopic），由 Topic 和 LiteTopic 共同唯一确认消息的存储容器**。
 
-当 Topic 类型设置为 Lite 类型时，Topic 下可以创建百万量级的 LiteTopic，每个 LiteTopic 默认由一个**独立的队列（Queue）**组成。
+当 Topic 类型设置为 Lite 类型时，Topic 下可以创建百万量级的 LiteTopic，每个 LiteTopic 在用户语义层面**默认由一个队列组成**（官方文档定义）。从存储底层实现来看，所有 LiteTopic 共享父 Topic 命名空间的队列资源池，父 Topic 的 `writeQueueNums` 决定了可同时分配的队列 ID 总数。
 
 #### 2.4 LiteTopic 最核心的设计思想
 
@@ -84,6 +83,8 @@ LiteTopic 的存储架构遵循 RocketMQ 的核心存储模型：
 - **LiteTopic**：二级资源，每个 LiteTopic 独立对应一个队列，拥有独立的存储空间。
 - **队列**：RocketMQ 中最小的存储单元，实现消息的顺序存储。
 
+> **注意**：LiteTopic 在存储引擎层拥有独立的 `TopicConfig`，通过 `topicSysFlag` 标记为 `TOPIC_FLAG_LITE`，与普通 Topic 并无存储上的包含关系。“父 Topic”描述是业务逻辑层面的抽象，用于资源的分组管理。
+
 这种设计的优势在于：每个 LiteTopic 拥有独立的存储队列，实现了**物理级别的数据隔离**，同时又共享父 Topic 的元数据和资源管理体系，避免了单独创建 Topic 的重资源开销。
 
 #### 3.3 事件驱动的唤醒机制
@@ -97,7 +98,27 @@ LiteTopic 实现了一个精妙的设计平衡：
 - **物理隔离**：每个用户或业务维度拥有独立的 LiteTopic（即独立的 Queue），实现数据层面的隔离；
 - **逻辑统一**：所有消费实例归属同一 ConsumerGroup，共享线程池等资源，避免因资源隔离导致资源利用率下降。
 
-消费者统一订阅父 Topic，并通过 SQL92 过滤器可以灵活选择消费特定的 LiteTopic 子集（例如只消费 `user_` 开头的 LiteTopic），实现不同的订阅集合。当 LiteTopic 动态新增或移除时，**消费者无需调整父 Topic 订阅**，只需保证过滤器表达式能覆盖需要的范围即可。
+消费者统一订阅父 Topic。对于筛选特定 LiteTopic 的场景，有两种方式：
+
+**✅ 推荐方式（业务层过滤）**：消费者接收父 Topic 下所有 LiteTopic 的消息，在代码中根据 `liteTopic` 字段进行过滤：
+```java
+for (MessageExt msg : msgs) {
+    String liteTopic = msg.getLiteTopic();
+    if (!targetLiteTopics.contains(liteTopic)) {
+        continue;   // 跳过非目标 LiteTopic
+    }
+    // 处理业务
+}
+```
+此方式性能最优，无 Broker 额外开销，且无需维护复杂的订阅关系变更。
+
+**⚠️ 备选方式（SQL92过滤器）**：通过 SQL92 表达式在 Broker 端过滤：
+```java
+consumer.subscribe(PARENT_TOPIC, MessageSelector.bySql("liteTopic like 'user_%'"));
+```
+**性能警告**：SQL92 过滤由 Broker 端执行，表达式解析和匹配会显著增加 CPU 开销。在 LiteTopic 这种高基数场景下，强烈建议优先使用业务层过滤。
+
+当 LiteTopic 动态新增或移除时，**消费者无需调整父 Topic 订阅**，只需保证过滤器表达式能覆盖需要的范围即可。
 
 **⚠️ 重要提醒**：同一消费者组内的所有消费者必须具有**完全相同的订阅关系**（包括相同的父 Topic 和完全一致的 SQL92 过滤表达式）。如果业务需要不同消费者处理不同的 LiteTopic 子集，应使用**不同的消费者组**，或者在消费者拉取全部消息后通过业务层二次过滤分发。LiteTopic 的灵活性在于**动态创建与自动销毁**，而非打破订阅关系一致性原则。
 
@@ -106,7 +127,7 @@ LiteTopic 实现了一个精妙的设计平衡：
 | 对比项 | 轻量类型主题（LiteTopic） | 普通类型主题 |
 |--------|--------------------------|-------------|
 | **二级资源** | 可在 Topic 下创建百万量级 LiteTopic | 无二级资源 |
-| **队列数量** | 每个 LiteTopic 默认 1 个队列 | 可配置多个队列 |
+| **队列数量** | 用户语义上默认 1 个队列；底层共享父 Topic 队列资源池 | 可配置多个队列 |
 | **生命周期** | 支持自动创建和自动删除 | 需手动管理 |
 | **订阅一致性** | 同一消费者组内，订阅关系（父Topic + 过滤表达式）**必须完全一致**。如需不同消费者处理不同 LiteTopic 子集，请使用不同 ConsumerGroup 或业务层过滤 | 同一消费者组内，订阅关系必须完全一致 |
 | **消费顺序性** | 顺序消费，一个 LiteTopic 只能被一个消费者线程处理 | 可选并发或顺序 |
@@ -116,6 +137,7 @@ LiteTopic 实现了一个精妙的设计平衡：
 **关键洞察**：LiteTopic 在“资源隔离”和“订阅灵活性”两个维度上带来了质变——订阅关系中的父 Topic 固定，但可以通过过滤器灵活选择 LiteTopic 子集。
 
 ---
+
 ## 第二部分：POP 消费模式 —— 消息粒度的负载均衡
 
 ### 第 5 章 POP 模式核心概念：从第一性原理出发
@@ -126,11 +148,9 @@ LiteTopic 实现了一个精妙的设计平衡：
 
 这个约束带来了三个层次的问题：
 
-**层次一（扩展性）** ：队列一次只能给组内一个消费者消费，消费并发受限于队列数量——即使有 100 个消费者，若只有 10 个队列，也只有 10 个能真正工作。
-
-**层次二（负载均衡）** ：消息队列与消费者数量不均衡时，会出现分配不匀、某些消费者承担过多队列的情况。
-
-**层次三（故障处理）** ：如果某个消费者 hang 住（如发生死锁、网络中断等），分配给它的队列中的消息将永远无法被消费，导致消息积压。
+- **层次一（扩展性）** ：队列一次只能给组内一个消费者消费，消费并发受限于队列数量——即使有 100 个消费者，若只有 10 个队列，也只有 10 个能真正工作。
+- **层次二（负载均衡）** ：消息队列与消费者数量不均衡时，会出现分配不匀、某些消费者承担过多队列的情况。
+- **层次三（故障处理）** ：如果某个消费者 hang 住（如发生死锁、网络中断等），分配给它的队列中的消息将永远无法被消费，导致消息积压。
 
 **第一性原理推演**：问题的本质是“以队列为分配粒度的负载均衡”——一个队列同一时刻只能被一个消费者消费。如果能打破这一约束，**将负载均衡的粒度从队列细化到消息**，让多个消费者可以并发地处理同一个队列中的不同消息，以上三个问题在理论上都可以得到解决。这正是 POP 模式的核心思想。
 
@@ -145,7 +165,9 @@ POP 模式的本质可以这样理解：**消息被 Broker 借出一段时间**�
 - 消息进入**不可见期**（invisibleTime），在此期间不可被其他消费者看到；
 - 处理成功后，消费者发送 ACK 确认；
 - 如果处理时间不够，消费者可以**续租**（ChangeInvisibleTime）；
-- 如果超时仍未确认，Broker 执行 **Revive（复活）** 机制，将消息重新放回队列或投递到 Retry Topic。
+- 如果超时仍未确认，Broker 执行 **Revive（复活）** 机制：
+  - **仅当消息因 invisibleTime 超时且未被 ACK 时触发**，Broker 将消息状态从“处理中”恢复，重新放回原 Queue 供同组任意消费者拉取，且**不增加 `reconsumeTimes`**。
+  - Revive **并非将消息投递到 `%RETRY%` Topic**；后者仅在消费者显式返回 `RECONSUME_LATER` 时触发，计入重试次数。
 
 ### 第 6 章 POP 模式架构设计与核心算法
 
@@ -202,18 +224,20 @@ POP 模式的真正并发能力来源于 Broker 端精确的“已投递但未�
 - **传统 Push 模式**：一个队列在同一时刻稳定分配给一个消费者
 - **POP 模式**：一个队列中的**不同消息**可以被不同消费者领走，Broker 追踪每一条“已投递但未完成”的消息状态
 
-> **关于锁竞争**：多个消费者同时拉取消息时，Broker 队列锁的竞争程度与消费者数量呈正相关。因此，POP 模式下消费者数量需要合理控制，不宜过度扩张。但这属于 POP 模式的固有特性，Broker 通过精细的状态管理已经在最大程度上优化了这一过程。
+> **关于锁竞争**：多个消费者同时拉取消息时，Broker 队列锁的竞争程度与消费者数量相关。RocketMQ 5.3.2+ 版本通过 RocksDB 异步存储机制和自适应锁优化显著降低了锁竞争开销，锁持有时长大幅缩短，消费者数量与锁竞争的敏感度相比早期版本已大大缓解。
 
 #### 6.4 POP 状态存储优化：RocksDB 方案（RIP-73）
 
-POP 模式在实践中的挑战在于“投递记录”数量巨大时的状态维护开销。RIP-73 提出了基于 RocksDB 的新实现方案，核心改进包括：
+RIP-73 提出了基于 RocksDB 的新实现方案，根据 Apache RocketMQ 5.3.2 官方发布说明，**该实现仍处于 alpha 阶段（alpha phase）**。核心改进包括：
 
-1. **不依赖定时消息**：新的 POP KV 实现不再依赖定时/延迟消息机制；
-2. **代码量大幅缩减**：从原来约三分之一（不含注释、单元测试和开关逻辑）；
-3. **解决磁盘占用问题**：旧实现因 POP Revive Log 写入 CommitLog 会占用磁盘空间并导致读放大，新方案有效解决；
-4. **性能提升显著**：同一环境下读写比为 1:1，关闭 buffer 时节约 Broker 整体 CPU 使用率的 28%，开启 buffer 时降低整体 CPU 使用率的 4.5%（其中 POP 部分降低 17%）。
+1. **不依赖定时消息**：新的 POP KV 实现不再依赖定时/延迟消息机制
+2. **代码量大幅缩减**：从原来约三分之一（不含注释、单元测试和开关逻辑）
+3. **解决磁盘占用问题**：旧实现因 POP Revive Log 写入 CommitLog 会占用磁盘空间并导致读放大，新方案有效解决
+4. **性能提升显著**：基于 RocksDB 的 POP 状态异步存储机制提升了消费性能
+5. ⚠️ **版本说明**：`alpha phase` 表示该特性可用于测试和评估，生产环境升级需谨慎验证
 
 ---
+
 ## 第三部分：生产实践与最佳实践
 
 ### 第 7 章 LiteTopic 典型应用场景与生产实践
@@ -267,7 +291,7 @@ POP 模式的并发能力来源于 Broker 侧的“处理中状态”管理—�
 
 **问题 1：LiteTopic TPS 上限瓶颈**
 - **现象**：单个 LiteTopic 的消息 TPS 达到上限。
-- **原因**：每个 LiteTopic 只有一个队列，单个队列的 TPS 上限有限。
+- **原因**：每个 LiteTopic 在用户语义层面只有一个队列，单个队列的 TPS 上限有限。
 - **解决方案**：业务上通过哈希分散到多个 LiteTopic，总 TPS 可随 LiteTopic 数量线性扩展。架构设计时对高流量业务应考虑水平切分。
 
 **问题 2：消费者订阅量过大**
@@ -284,8 +308,8 @@ POP 模式的并发能力来源于 Broker 侧的“处理中状态”管理—�
 
 **问题 1：POP 消费者锁竞争导致消费不均**
 - **现象**：部分消费者得不到消息，出现资源浪费。
-- **原因**：Broker 在 POP 时通过 Lock Consumer Queue 实现消息领取，多个 POP 消费者进行锁竞争的时间和消费者数量**成正比**。消费者越多，锁竞争越激烈，部分消费者等待锁的时间越长，可能导致消息分配不均和资源浪费。
-- **解决方案**：合理控制消费者实例数量。当消费者数量过多时，锁竞争加剧，部分消费者会长时间获取不到锁，造成资源浪费。
+- **原因**：Broker 在 POP 时通过 Lock Consumer Queue 实现消息领取，多个 POP 消费者进行锁竞争的时间和消费者数量相关。在早期版本中线性正相关较明显，5.3.2+ 版本通过 RocksDB 异步存储和自适应锁优化已显著缓解。
+- **解决方案**：合理控制消费者实例数量，升级到 5.3.2+ 版本以利用优化后的锁机制。
 
 **问题 2：POP 消息处理超时与重复消费**
 - **现象**：消息被多次消费，引起数据不一致。
@@ -336,19 +360,29 @@ Maven 依赖配置如下：
 
 #### 10.2 父 Topic 创建（服务端操作）
 
-创建父 Topic 时需将其类型设置为 `LITE`。**⚠️ 参数兼容性说明**：不同 RocketMQ 5.x 小版本对 `-m LITE` 参数的支持可能存在差异。建议执行 `mqadmin updateTopic -h` 查看当前版本支持的参数。
+**⚠️ LiteTopic 创建兼容性最佳实践**
 
-- 在 RocketMQ 5.1.0 及以后版本中，`-m LITE` 通常有效。
-- 在更早版本（如 5.0.0）中，可能需要使用 `-l true` 或 `--lite true` 来创建轻量级主题。
+RocketMQ 5.0.x 早期版本使用 `-l true` 标识 LiteTopic；从 5.1.0+ 版本开始，`-m LITE` 成为推荐标准参数。**强烈建议使用以下通用步骤，避免版本兼容性问题**：
 
-推荐命令（兼容两种方式）：
+1. **通过 Broker 配置文件开启 LiteTopic**（最稳定、不受 mqadmin 参数影响）：
+   ```properties
+   autoCreateTopicEnable=true
+   enableLiteTopic=true
+   ```
 
+2. **升级到 5.5.0+ 获得最佳兼容性**：5.5.0 版本正式引入了完整的轻量级消息模型 Lite Mode，是所有新生产环境推荐的基线版本。
+
+3. **若必须使用 mqadmin**，在命令行中同时尝试两种写法，提高兼容性：
+   - 5.1.0+：`-m LITE`
+   - 5.0.x：`-l true`
+
+推荐命令示例（兼容两种方式）：
 ```bash
 # 方式一（5.1.0+）：
 mqadmin updateTopic -n <namesrvAddr> -b <brokerAddr> -t rate-limit-parent-topic \
   -r 8 -w 8 -c DefaultCluster -m LITE -o true
 
-# 方式二（5.0.0+，更通用）：
+# 方式二（5.0.x）：
 mqadmin updateTopic -n <namesrvAddr> -b <brokerAddr> -t rate-limit-parent-topic \
   -r 8 -w 8 -c DefaultCluster -l true -o true
 ```
@@ -357,9 +391,11 @@ mqadmin updateTopic -n <namesrvAddr> -b <brokerAddr> -t rate-limit-parent-topic 
 - `-m LITE` 或 `-l true`：设置主题类型为轻量级主题
 - `-o true`：允许自动创建 LiteTopic（建议开启）
 - 可选参数 `expiration`：设置 LiteTopic 过期时间（单位：分钟），如 `-a expiration=720` 表示 LiteTopic 无新消息写入 720 分钟后自动删除
-- `-r` 和 `-w`：父 Topic 的读队列数和写队列数，决定了父 Topic 下可以同时存活的 LiteTopic 数量上限（每个 LiteTopic 独占一个队列，队列总数必须大于等于预期的最大 LiteTopic 数量）
+- `-r` 和 `-w`：父 Topic 的读队列数和写队列数
 
-**父 Topic 队列数配置**：父 Topic 的队列数决定了父 Topic 的整体 TPS 上限以及可同时存在的 LiteTopic 数量上限。建议根据预期的最大 LiteTopic 数量设置足够的队列数（例如，若预计最多 10000 个 LiteTopic，则队列数至少需要 10000）。队列数可动态增加（需重启 Broker），但不建议频繁变更。
+**父 Topic 队列数配置说明**：
+- LiteTopic 在用户语义层面默认由一个队列组成（官方文档定义）。但从存储底层实现来看，所有 LiteTopic 共享父 Topic 命名空间的队列资源池，因此父 Topic 的 `writeQueueNums` 决定了可同时分配的队列 ID 总数。
+- 当预估 LiteTopic 总数量时需要确保 `writeQueueNums` ≥ LiteTopic 数量，以避免队列 ID 哈希冲突。以上仅为底层实现细节，不影响 LiteTopic 的用户语义。
 
 父 Topic 创建完成后，无需为每个用户/会话单独创建 Topic，后续 LiteTopic 将按需自动生成。
 
@@ -485,17 +521,15 @@ POP 模式下，可以通过返回 `PopStatus.SUSPEND` 或使用 `context.setSus
 
 #### 10.5 动态筛选 LiteTopic（不使用独立订阅）
 
-**注意**：LiteTopic 的设计理念是**消费者订阅父 Topic 后默认消费所有 LiteTopic**，不支持单独订阅或取消订阅某个 LiteTopic。如果需要动态选择消费哪些 LiteTopic，可以使用 **SQL92 消息过滤器**，通过更新过滤表达式来实现：
+**注意**：LiteTopic 的设计理念是**消费者订阅父 Topic 后默认消费所有 LiteTopic**，不支持单独订阅或取消订阅某个 LiteTopic。
 
+**✅ 推荐方式（业务层过滤）**：所有 LiteTopic 全量消费 + 业务层过滤，通过内存中的白名单/黑名单动态控制，无需重启。
+
+**⚠️ 备选方式（SQL92过滤器）**：如果必须使用 SQL92，请注意性能影响：
 ```java
-// 初始订阅时只消费特定模式的 LiteTopic（例如以 "user_" 开头的）
 consumer.subscribe(PARENT_TOPIC, MessageSelector.bySql("liteTopic like 'user_%'"));
-
-// 动态修改过滤器（需重启消费者或通过动态配置中心实现）
-// 注意：RocketMQ 原生不支持运行时无感修改订阅表达式，建议结合配置中心实现热加载
 ```
-
-由于过滤器表达式变更通常需要重启消费者，对于频繁增减订阅 LiteTopic 的场景，建议采用**所有 LiteTopic 全量消费 + 业务层过滤**的方式，通过内存中的白名单/黑名单动态控制，避免重启。
+**强烈建议优先使用业务层过滤**，因为 SQL92 过滤由 Broker 端执行，表达式解析和匹配会显著增加 CPU 开销。
 
 #### 10.6 消费者核心配置参数详解
 
@@ -507,7 +541,7 @@ consumer.subscribe(PARENT_TOPIC, MessageSelector.bySql("liteTopic like 'user_%'"
 | `setPullBatchSize` | 单次拉取消息的最大条数（**非POP模式有效**，POP模式请用 `setPopBatchSize`） | 默认 32，根据消息体大小调整 |
 | `setConsumeMessageBatchMaxSize` | 批量消费时单批次最多消息数（**非POP模式有效**） | 默认 1，批量消费时可调整至 8-32 |
 | `setSuspendCurrentQueueTimeMillis` | 消费失败时挂起队列的时间（毫秒） | 默认 1000 |
-| 父 Topic 队列数 | 父 Topic 的队列数量决定可同时存活的 LiteTopic 上限 | 应 ≥ 预期的最大 LiteTopic 数量 |
+| 父 Topic 队列数 | 父 Topic 的队列数量决定可同时存活的 LiteTopic 数量上限（底层实现） | 应 ≥ 预期的最大 LiteTopic 数量 |
 | LiteTopic 订阅上限 | 单消费者可有效处理的 LiteTopic 数量 | 千量级（超过可能性能下降） |
 
 > **线程池配置说明**：`consumeThreadMax` 参数设定的最大线程数在 RocketMQ 的默认线程池配置（无界队列）下可能不会严格生效，实际最大线程数由系统资源和队列大小共同决定。如需精确控制并发度，应合理设置 `consumeThreadMin` 并监控实际线程数。
@@ -530,7 +564,7 @@ consumer.subscribe(PARENT_TOPIC, MessageSelector.bySql("liteTopic like 'user_%'"
 | 创建 Topic | 需预先创建 Topic 元数据 | 父 Topic 需预先创建，LiteTopic 自动按需生成 |
 | 发送消息 | `new Message(topic, body)` | `new Message(parentTopic, body); msg.setLiteTopic(liteTopicName)` |
 | 订阅消息 | `consumer.subscribe(topic, subExpression)` | `consumer.subscribe(parentTopic, subExpression)` |
-| 动态筛选 | 普通过滤表达式 | 可使用 SQL92 按 `liteTopic` 属性过滤 |
+| 动态筛选 | 普通过滤表达式 | 可使用 SQL92 按 `liteTopic` 属性过滤（不推荐） |
 | 订阅关系 | 同一 Group 下必须完全一致 | 同一 Group 下必须完全一致 |
 
 #### 10.8 POP 模式 Java 客户端配置
@@ -594,7 +628,7 @@ public class PopPushConsumer {
         consumer.setPopInvisibleTime(30000);  // 30秒
         // 3. 设置 POP 批量拉取条数（可选，默认 8）
         consumer.setPopBatchSize(16);
-        // 4. 设置批量消费条数，POP模式下建议设置为1，避免单批处理时间过长
+        // 4. ⚠️ 推荐设置：POP模式下建议 consumeMessageBatchMaxSize = 1
         consumer.setConsumeMessageBatchMaxSize(1);
         // 5. 确保 instanceName 唯一
         consumer.setInstanceName(String.valueOf(System.nanoTime()));
@@ -604,35 +638,25 @@ public class PopPushConsumer {
             public ConsumeConcurrentlyStatus consumeMessage(
                     List<MessageExt> msgs, ConsumeConcurrentlyContext context) {
                 for (MessageExt msg : msgs) {
-                    long startTime = System.currentTimeMillis();
-                    long invisibleTime = consumer.getPopInvisibleTime();
-                    
-                    while (true) {
+                    try {
+                        // 执行实际业务逻辑
+                        processBusiness(msg);
+                    } catch (NeedMoreTimeException e) {
+                        // 业务处理时间可能超过 invisibleTime，请求续租
                         try {
-                            // 执行实际业务逻辑
-                            processBusiness(msg);
-                            break;  // 业务成功完成，跳出重试循环
-                        } catch (NeedMoreTimeException e) {
-                            // 检查是否还有时间窗口可续租
-                            long elapsed = System.currentTimeMillis() - startTime;
-                            if (elapsed >= invisibleTime) {
-                                // 已无时间续租，返回重试让消息重新投递
-                                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
-                            }
-                            
-                            try {
-                                // 续租，延长不可见期
-                                // ⚠️ 重要：changeInvisibleTime 仅延长不可见期，不能替代 ACK
-                                consumer.changeInvisibleTime(msg, invisibleTime);
-                                // 续租成功后，继续循环，重新执行业务逻辑
-                            } catch (Exception ex) {
-                                // 续租失败，返回重试
-                                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
-                            }
-                        } catch (Exception e) {
-                            // 业务其他异常，返回重试
+                            // 续租，延长不可见期
+                            // ⚠️ 续租的语义：修改消息的不可见时间，不是确认消费，不能替代 ACK
+                            consumer.changeInvisibleTime(msg, 30000);
+                            // ⚠️ 续租成功后必须返回 RECONSUME_LATER
+                            // 原因：返回 RECONSUME_LATER 时消息会被重新入队，由同消费者或其他消费者重试
+                            //       续租保证了消息在重新入队后仍处于可见状态，不会因超时而被 Broker 复活
+                            //       返回 CONSUME_SUCCESS 则 Broker 会删除消息，导致业务丢失
+                            return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+                        } catch (Exception ex) {
                             return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                         }
+                    } catch (Exception e) {
+                        return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                     }
                 }
                 return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
@@ -649,29 +673,26 @@ public class PopPushConsumer {
 }
 ```
 
-> **续租逻辑说明**：  
-> 当业务处理时间可能超过 `popInvisibleTime` 时，应调用 `changeInvisibleTime` 延长不可见期，然后**返回 `RECONSUME_LATER`**，让消息稍后重新进入消费队列，而不是错误地返回 `CONSUME_SUCCESS`。`changeInvisibleTime` 仅延长不可见期，不能替代 ACK。实际生产建议使用**状态机+异步确认**模式，或者将长时任务拆分为多个阶段。上述示例仅为演示API用法，完整实现需根据业务设计合理重试与续租策略。
+> **续租逻辑说明**：
+> - `changeInvisibleTime` 的语义是修改消息的不可见时间，而不是确认消息消费
+> - 续租成功后**必须返回 `RECONSUME_LATER`**，让当前消费线程释放回线程池，由 Broker 对消息重新进行投递和消费
+> - 不能返回 `CONSUME_SUCCESS`（会导致业务丢失），也不应在续租后阻塞循环（会导致线程池耗尽）
+> - 实际生产建议使用**状态机+异步确认**模式，或者将长时任务拆分为多个阶段。上述示例仅为演示API用法，完整实现需根据业务设计合理重试与续租策略。
 
 **⚠️ POP 模式下的批量消费配置注意事项**
 
 在 POP 模式下，有两个核心配置需要特别注意：
 - `setPopBatchSize(int)`：单次从 Broker 拉取的消息条数上限（默认 8）
-- `setConsumeMessageBatchMaxSize(int)`：单次回调中传入的消息列表最大长度（默认 1）
+- `setConsumeMessageBatchMaxSize(int)`：单次回调中传入的消息列表最大长度（默认 1，最大值不超过 32）
 
-**推荐配置**：由于 POP 模式下的 `invisibleTime` 从拉取时开始计时，单次回调处理多条消息会累积处理时间，极易触发超时导致消息被 Revive 重新投递。建议将 `consumeMessageBatchMaxSize` 设置为 1，或确保单批总处理时间远小于 `invisibleTime`。
-
-```java
-consumer.setPopBatchSize(8);                          // 一次拉取 8 条
-consumer.setConsumeMessageBatchMaxSize(1);            // 一次处理 1 条
-consumer.setPopInvisibleTime(P99处理时间 * 2);        // 留有足够余量
-```
-
-**如果必须使用批量消费**：
-- 确保 `consumeMessageBatchMaxSize` ≤ `popBatchSize`
-- 单批消息总处理时间 ≤ 0.7 × `invisibleTime`（预留续租窗口）
-- 在消息处理循环内，每处理完一条消息就调用 `changeInvisibleTime` 续租，防止整批超时
-
-`consumeMessageBatchMaxSize` 的最大值为 32，建议慎重调大。
+> **调优建议**：
+>
+> | 场景 | 批量大小推荐 | 关键约束 |
+> |------|-------------|----------|
+> | 长时任务（秒级），追求稳定性 | `consumeMessageBatchMaxSize = 1` | 最安全 |
+> | 极速短任务（微秒/毫秒级），追求吞吐量 | `consumeMessageBatchMaxSize = 8-32` | 单批总处理时间 < `invisibleTime` |
+>
+> **注意**：`consumeMessageBatchMaxSize` 的最大值为 32。超过 `invisibleTime` 时整批消息会被 Broker 判定超时并 Revive 重新入队。
 
 **POP 模式消费者核心配置参数**：
 
@@ -723,7 +744,7 @@ public class PopIdempotentConsumer {
 | **LiteTopic 服务端** | 5.0.0+（生产推荐 5.5.0+） | LiteTopic 功能自 5.0 引入，5.5 后更稳定 |
 | **LiteTopic 客户端** | 5.1.0+（推荐 5.1.4+） | 需支持 `setLiteTopic` 方法 |
 | **POP 模式** | 5.0.0+ | RocketMQ 5.0 开始引入 |
-| **POP + RocksDB 优化** | 5.3.2+ | RIP-73 显著提升性能 |
+| **POP + RocksDB 优化** | 5.3.2+（alpha phase） | RIP-73 可用于测试评估，生产升级需谨慎 |
 | **推荐生产版本** | 5.3.3 / 5.4.0+（POP）；5.5.0+（LiteTopic） | 稳定性最佳 |
 
 **升级注意事项**：
@@ -743,7 +764,7 @@ public class PopIdempotentConsumer {
 | `expiration` | LiteTopic 过期时间（分钟） | 30-720 分钟，默认 60 分钟 |
 | LiteTopic 命名规范 | 推荐 `{业务类型}_{业务ID}` 格式 | 如 `chat_session123`、`task_user456` |
 | `setLiteTopic` | 发送时设置 LiteTopic | 自动创建，无需预创建 |
-| 父 Topic 队列数 | 父 Topic 的队列总数 | 应 ≥ 最大预期 LiteTopic 数量 |
+| 父 Topic 队列数 | 父 Topic 的队列总数（底层资源池） | 应 ≥ 最大预期 LiteTopic 数量 |
 
 #### 11.2 POP 模式核心配置参数
 
@@ -759,7 +780,7 @@ public class PopIdempotentConsumer {
 采用 `{业务类型}_{业务ID}` 的命名规范（如 `chat_session123`），便于问题排查和监控。根据业务场景设置合理的 `expiration`，避免 LiteTopic 数量无限增长。ID 生成采用自增型数值效率最高。
 
 **2. 容量规划**
-父 Topic 队列数应大于等于预期的最大 LiteTopic 数量。每个 LiteTopic 的 TPS 上限受限于单队列性能，但总 TPS 可随 LiteTopic 数量线性扩展。架构设计时按业务维度拆分，将高流量业务分散到不同 LiteTopic。
+父 Topic 队列数应大于等于预期的最大 LiteTopic 数量（底层资源池要求）。每个 LiteTopic 的 TPS 上限受限于单队列性能，但总 TPS 可随 LiteTopic 数量线性扩展。架构设计时按业务维度拆分，将高流量业务分散到不同 LiteTopic。
 
 **3. 高可用设计：无状态应用服务器设计**
 应用服务器不存储会话状态，所有状态依赖 RocketMQ 持久化。节点故障时，其他节点可通过重新订阅对应 LiteTopic 实现状态接管和断点续传。LiteTopic 内置消息持久化和偏移量管理，确保断点续传能力。
@@ -776,18 +797,18 @@ public class PopIdempotentConsumer {
 根据实际业务处理时间分布，选择合适的不可见期长度。设置过短会导致频繁超时重投；设置过长会影响并发能力。对处理时间波动较大的业务，建议配合 `changeInvisibleTime` 动态续租。
 
 **2. 消费者数量控制**
-理解并接受 POP 模式下消费者数量与实际工作效率的关系：消费者数量并非越多越好，过度的锁竞争反而会降低整体效率。
+理解并接受 POP 模式下消费者数量与实际工作效率的关系：消费者数量并非越多越好，过度的锁竞争反而会降低整体效率。5.3.2+ 版本已显著优化锁竞争，但仍需合理控制。
 
 **3. 幂等消费设计**
 由于超时重投机制的存在，POP 模式下同一条消息可能被多次投递。**所有 POP 消费端必须实现幂等处理**（建议基于业务唯一 ID 进行去重）。
 
 **4. 消息过滤优化**
-使用 POP 模式时，**过滤比例过高将严重影响 POP 消费性能**。应尽可能减少过滤逻辑的复杂度；在过滤比例极低的场景需评估性能影响并考虑优化措施。
+使用 POP 模式时，**过滤比例过高将严重影响 POP 消费性能**。应尽可能减少过滤逻辑的复杂度；在过滤比例极低的场景需评估性能影响并考虑优化措施。对于 LiteTopic 场景，**强烈推荐使用业务层过滤而非 SQL92 过滤**。
 
 **5. 版本选型建议**
-- **推荐版本**：RocketMQ 5.3.2 及以上 + 启用 RocksDB 状态存储（RIP-73）
+- **推荐版本**：RocketMQ 5.3.2 及以上 + 启用 RocksDB 状态存储（RIP-73，alpha phase 谨慎评估）
 - **5.3.1 及以下**：存在已知 bug，建议升级
-- 性能敏感场景：关注 RIP-73 带来的 CPU 使用率下降收益（开启 buffer 下降 4.5%，POP 部分下降 17%）
+- **生产环境 LiteTopic 推荐 5.5.0+**：5.5.0 版本正式引入完整的轻量级消息模型 Lite Mode
 
 ### 第 12 章 结语
 
