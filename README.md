@@ -1,5 +1,5 @@
 # developer-knowledge
-   
+   ***以下资源均是AI 生成，仅作参考***
 * [Architecture Design](<./architecture/架构设计指南.md>) 
 * [AI](AI大模型.md) 
 * [Redis](./redis/Redis专家级技术文档：从第一性原理到生产实践.md)  
@@ -30,5 +30,5 @@
 优化提示词：逐轮核查、修正并迭代，直至连续两次未发现新问题，最终输出完整文档与所有修正记录。
 
 
-请按技术文档全链路质控与重构专家 Skill.md， 检查修复Spring专家级学习文档：从第一性原理到架构本质.md
+请按技术文档全链路质控与重构专家 Skill.md， 检查修复上传的Seata文档，不要省略任何信息，输出格式markdown
 
