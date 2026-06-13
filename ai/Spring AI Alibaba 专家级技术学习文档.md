@@ -64,11 +64,11 @@ public class ChatController {
 
 ### 1.2 Spring AI vs Spring AI Alibaba 定位说明
 
-| 维度 | Spring AI | Spring AI Alibaba |
-|------|-----------|-------------------|
-| **定位** | AI 应用开发**底层框架** | AI 智能体**高层框架** |
+| 维度       | Spring AI                | Spring AI Alibaba                                                                           |
+| -------- | ------------------------ | ------------------------------------------------------------------------------------------- |
+| **定位**   | AI 应用开发**底层框架**          | AI 智能体**高层框架**                                                                              |
 | **提供能力** | 模型适配、工具定义、向量数据库存取等底层原子抽象 | 基于图的智能体编程 Graph 框架（包括 ReactAgent、SequentialAgent、ParallelAgent），让开发者更容易开发工作流、multi-agent 应用 |
-| **类比** | “发动机”——提供 AI 交互的核心能力 | “整车”——提供完整的工作流、Agent 编排能力 |
+| **类比**   | “发动机”——提供 AI 交互的核心能力     | “整车”——提供完整的工作流、Agent 编排能力                                                                   |
 
 > Spring AI 定位 AI 应用开发底层框架，提供 AI 开发需要的底层原子抽象；Spring AI Alibaba 则定位 AI 智能体开发框架，在前者基础上提供了 Graph 智能体编程框架，让开发者更容易开发 ChatBot、工作流、Multi-Agent 应用。
 
