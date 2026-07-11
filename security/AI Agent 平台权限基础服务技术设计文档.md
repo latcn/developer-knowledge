@@ -28,33 +28,33 @@
 
 ### 1.2 核心能力（V14.0 终版）
 
-| 能力域 | 说明 |
-| ------ | ---- |
-| **功能权限管理** | 用户能否执行某个操作（如 `order:export`）的规则定义与存储 |
-| **数据权限管理** | 用户能操作哪些数据行的规则定义（通过行级规则实现），支持 **ALLOW/DENY** 策略及**角色优先级** |
-| **角色与权限绑定** | 角色定义、角色优先级、角色-权限关联（含行级规则），优先级在DENY/ALLOW冲突时生效 |
-| **Token Exchange 数据聚合** | 一次调用返回 Token Exchange 所需的所有权限数据 |
-| **双版本权限管理** | 用户个人版本（`user_perm_ver`）+ 角色版本（`role_version`）MD5聚合 + 乐观锁快速失败 |
-| **操作审计追溯** | 通过 `t_audit_log` 记录所有权限管理操作的**增量变更（Diff）** 审计轨迹，使用RocketMQ外部队列保证不丢失 |
-| **版本变更追溯** | 通过 `t_permission_version_history` 和 `t_role_permission_version_history` 追溯版本变化原因 |
-| **缓存与消息** | 多级缓存（Caffeine `AsyncLoadingCache` + Redis）+ RocketMQ 动态ConsumerGroup伪广播 + 反向索引 + RemovalListener自动清理 |
-| **降级与熔断** | 数据面集成Feign Fallback + Resilience4j熔断器，控制面不可用时使用Redis缓存降级 |
+| 能力域                     | 说明                                                                                                   |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- |
+| **功能权限管理**              | 用户能否执行某个操作（如 `order:export`）的规则定义与存储                                                                 |
+| **数据权限管理**              | 用户能操作哪些数据行的规则定义（通过行级规则实现），支持 **ALLOW/DENY** 策略及**角色优先级**                                             |
+| **角色与权限绑定**             | 角色定义、角色优先级、角色-权限关联（含行级规则），优先级在DENY/ALLOW冲突时生效                                                        |
+| **Token Exchange 数据聚合** | 一次调用返回 Token Exchange 所需的所有权限数据                                                                      |
+| **双版本权限管理**             | 用户个人版本（`user_perm_ver`）+ 角色版本（`role_version`）MD5聚合 + 乐观锁快速失败                                         |
+| **操作审计追溯**              | 通过 `t_audit_log` 记录所有权限管理操作的**增量变更（Diff）** 审计轨迹，使用RocketMQ外部队列保证不丢失                                  |
+| **版本变更追溯**              | 通过 `t_permission_version_history` 和 `t_role_permission_version_history` 追溯版本变化原因                     |
+| **缓存与消息**               | 多级缓存（Caffeine `AsyncLoadingCache` + Redis）+ RocketMQ 动态ConsumerGroup伪广播 + 反向索引 + RemovalListener自动清理 |
+| **降级与熔断**               | 数据面集成Feign Fallback + Resilience4j熔断器，控制面不可用时使用Redis缓存降级                                             |
 
 
 ## 2. 核心设计原则
 
-| 原则 | 说明 |
-| ---- | ---- |
-| **物理隔离** | `a2a-permission-remote`（纯远程调用）和 `a2a-permission-admin`（控制面）分属不同模块，上层调用方**永远不引入** `admin` 模块，编译期杜绝误用本地 DB 调用的可能 |
-| **读写分离** | 控制面（Admin模块）负责写入和计算，数据面（Remote模块）负责读取和缓存 |
-| **远程调用** | `remote` 模块仅提供 Feign 远程调用能力，**不包含任何本地 DB 实现** |
-| **缓存优先** | 所有读取操作优先走多级缓存（Caffeine → Redis），使用 `AsyncLoadingCache` 防缓存击穿 |
-| **最终一致性** | 权限变更通过 RocketMQ 广播，数据面缓存异步刷新；审计日志通过RocketMQ外部队列保证不丢失 |
-| **双版本驱动** | 用户权限版本 + 角色权限版本 MD5聚合共同决定 Token 有效性 |
-| **安全左移** | 行级规则模板必须通过 AST 语法树校验，运行时强制使用 MyBatis-Plus `apply` 参数绑定 |
-| **审计轻量化** | 操作详情仅记录增量变化（Diff），使用强类型 `AuditDiff` 抽象类保证 JSON 结构严格一致 |
-| **降级兜底** | 数据面集成 Feign Fallback 和熔断器，控制面不可用时使用 Redis 缓存降级鉴权 |
-| **乐观锁快速失败** | 版本号更新采用乐观锁机制（`WHERE version = #{oldVersion}`），并发冲突时快速抛出异常 |
+| 原则          | 说明                                                                                                             |
+| ----------- | -------------------------------------------------------------------------------------------------------------- |
+| **物理隔离**    | `a2a-permission-remote`（纯远程调用）和 `a2a-permission-admin`（控制面）分属不同模块，上层调用方**永远不引入** `admin` 模块，编译期杜绝误用本地 DB 调用的可能 |
+| **读写分离**    | 控制面（Admin模块）负责写入和计算，数据面（Remote模块）负责读取和缓存                                                                       |
+| **远程调用**    | `remote` 模块仅提供 Feign 远程调用能力，**不包含任何本地 DB 实现**                                                                  |
+| **缓存优先**    | 所有读取操作优先走多级缓存（Caffeine → Redis），使用 `AsyncLoadingCache` 防缓存击穿                                                   |
+| **最终一致性**   | 权限变更通过 RocketMQ 广播，数据面缓存异步刷新；审计日志通过RocketMQ外部队列保证不丢失                                                           |
+| **双版本驱动**   | 用户权限版本 + 角色权限版本 MD5聚合共同决定 Token 有效性                                                                            |
+| **安全左移**    | 行级规则模板必须通过 AST 语法树校验，运行时强制使用 MyBatis-Plus `apply` 参数绑定                                                         |
+| **审计轻量化**   | 操作详情仅记录增量变化（Diff），使用强类型 `AuditDiff` 抽象类保证 JSON 结构严格一致                                                          |
+| **降级兜底**    | 数据面集成 Feign Fallback 和熔断器，控制面不可用时使用 Redis 缓存降级鉴权                                                               |
+| **乐观锁快速失败** | 版本号更新采用乐观锁机制（`WHERE version = #{oldVersion}`），并发冲突时快速抛出异常                                                      |
 
 
 ## 3. 整体架构设计
