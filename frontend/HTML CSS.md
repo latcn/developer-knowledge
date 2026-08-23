@@ -1,101 +1,359 @@
-**HTML 是“数据结构”，CSS 是“渲染算法”**。CSS 的布局模型（Flex/Grid）本质上是在解决“在不确定大小的容器中，如何分配有限空间”的数学问题（类似内存分配算法）。
+# 🎨 HTML/CSS 完整指南：从本质到工程化实践
 
-结合你提供的 `deepseek-harness`（DSH）源码，我会把核心原理、避坑指南（如著名的 `min-width:0` 陷阱）和一份**可直接运行的完整项目源码**整合成这份文档。
+> **适用读者**：具备后端开发经验，希望系统掌握前端渲染原理与工程化 CSS 架构的开发者。
+
+这份指南汇总了此前所有对话的核心知识，并按照 **"本质原理 → 概念详解 → 设计哲学 → 最佳实践 → 完整源码"** 的脉络重新组织。你可以把它当作一份**可运行的、带详细注释的参考手册**。
 
 ---
-# 📐 后端视角的 HTML/CSS 布局完全指南（Flex/Grid 篇）
 
-## 一、HTML 语义与 CSS 盒模型（"内存结构"基础）
+## 第一部分：HTML/CSS 的本质（后端视角）
 
-### 1.1 盒模型（Box Model）
-HTML 每一个元素都是一个矩形“盒子”，由外到内：**Margin（外边距） -> Border（边框） -> Padding（内边距） -> Content（内容）**。
-- **标准盒模型（`box-sizing: content-box`）**：宽高只算 Content。Padding 和 Border 会撑大盒子（像后端结构体未对齐，容易算错总大小）。
-- **怪异盒模型（`box-sizing: border-box`）**：宽高 = Content + Padding + Border。**这是现代前端铁律**，解决了“加 padding 撑破父容器”的痛点。
+### 1.1 渲染管线的硬件协作
 
-**最佳实践**：在全局样式中统一重置。
-```css
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+| 阶段 | 执行硬件 | 产物 | 类比 |
+| :--- | :--- | :--- | :--- |
+| **DOM 树构建** | CPU | 内存中的节点树 | 解析 JSON 生成对象模型 |
+| **样式计算（Style）** | CPU | 每个节点的最终样式 | 配置合并（覆盖/继承） |
+| **布局（Layout/Reflow）** | CPU | 每个节点的几何信息（x, y, w, h） | 内存分配/地址计算 |
+| **绘制（Paint）** | CPU → 内存 | 位图（Bitmap） | 序列化为二进制数据 |
+| **上传纹理** | CPU → GPU 总线 | 显存中的纹理（Texture） | DMA 拷贝 |
+| **合成（Composite）** | GPU | 屏幕像素 | 矩阵乘法 + 光栅化 |
+
+### 1.2 核心性能定律
+
+> **"CPU 负责画图（Paint）和算布局（Layout），GPU 负责贴图（Composite）。"**
+
+- **改变 `left/top/width/height`** → 触发 **Layout → Paint → Composite**（CPU 重活）
+- **改变 `transform/opacity`** → 仅触发 **Composite**（GPU 轻活）
+
+### 1.3 为什么会有"回流（Reflow）"和"重绘（Repaint）"？
+
+- **回流（Reflow）** = **Layout 阶段**。当元素的几何尺寸（宽高、边距、位置）变化时，浏览器必须重新计算整个受影响子树的所有节点的位置。这是 **CPU 最昂贵的操作**（相当于数据库中修改了表结构，需要重建索引）。
+- **重绘（Repaint）** = **Paint 阶段**。当元素的颜色、背景、阴影等不影响几何的属性变化时，浏览器只需重新绘制该节点的位图，不触发布局。**代价比回流低，但仍消耗 CPU**。
+- **合成（Composite）** = 仅 GPU 操作，**完全不碰 CPU**。
+
+---
+
+## 第二部分：CSS 盒模型（Box Model）—— 一切布局的基石
+
+### 2.1 盒模型的"洋葱结构"
+
+从外到内：**Margin（外边距） → Border（边框） → Padding（内边距） → Content（内容区）**
+
+```text
+┌─────────────────────────────────────────────┐
+│                 Margin（透明）               │
+│  ┌─────────────────────────────────────────┐│
+│  │              Border                     ││
+│  │  ┌─────────────────────────────────┐   ││
+│  │  │          Padding                │   ││
+│  │  │  ┌─────────────────────────┐   │   ││
+│  │  │  │       Content           │   │   ││
+│  │  │  │                         │   │   ││
+│  │  │  └─────────────────────────┘   │   ││
+│  │  └─────────────────────────────────┘   ││
+│  └─────────────────────────────────────────┘│
+└─────────────────────────────────────────────┘
 ```
 
-### 1.2 BFC（块级格式化上下文）与 包含块
-- **BFC**：可以理解为 CSS 的“作用域隔离”。触发 BFC（如 `overflow: hidden`, `display: flex`）后，内部浮动不会影响外部，上下外边距不再重叠。
-- **包含块（Containing Block）**：决定元素尺寸/位置参考的父级。DSH 源码文档 2.8 强调 **“transform 会让 fixed 定位失效”**，就是因为 transform 创建了新的包含块。
+### 2.2 `box-sizing`：两种计算模式的本质
+
+| 模式 | CSS 设置 | `width: 200px; padding: 20px; border: 2px;` 的实际渲染宽度 | 记忆口诀 |
+| :--- | :--- | :--- | :--- |
+| **标准盒模型（W3C）** | `box-sizing: content-box` | **200 + 20×2 + 2×2 = 244px**<br>（padding 和 border 向外撑大） | "设置即内容" |
+| **怪异盒模型（IE）** | `box-sizing: border-box` | **200px**（padding 和 border 向内挤压内容区） | "设置即总宽" |
+
+**为什么 `border-box` 是前端铁律？**
+- 当你说 `width: 50%` 时，你希望它**正好占父容器的一半**，而不是"一半 + 内边距 + 边框"。
+- 类比后端：这就好比你在配置线程池大小，`coreSize=10` 就应该正好 10 个线程，而不是 10 + 一些额外开销。
+
+**最佳实践（DSH 源码风格）**：
+```css
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+```
+所有元素统一为 `border-box`，彻底消灭尺寸计算的心智负担。
 
 ---
 
-## 二、Flexbox（一维布局模型）—— 解决“主轴/交叉轴”分配
+## 第三部分：Flexbox（一维布局模型）
 
-Flex 适用于**单行或单列**的对齐和分布（如导航栏、列表居中）。
+### 3.1 主轴（Main Axis）与交叉轴（Cross Axis）
 
-### 2.1 核心原理（数学逻辑）
-父容器 `display: flex` 会建立两条轴：
-- **主轴（Main Axis）**：由 `flex-direction` 决定（row 横向，column 纵向）。
-- **交叉轴（Cross Axis）**：垂直于主轴。
+Flexbox 的本质是 **"在一条轴上分配剩余空间"**。
 
-**空间分配算法**：子项的 `flex-grow`（伸展权重）、`flex-shrink`（收缩权重）、`flex-basis`（基准尺寸）共同决定了剩余空间的“博弈”结果。
-- 公式（简化）：**剩余空间 = 容器尺寸 - 所有子项 flex-basis 之和**。`flex-grow` 按比例瓜分正剩余空间，`flex-shrink` 按比例消化负剩余空间。
+```text
+         主轴方向（flex-direction: row → 从左到右）
+         ════════════════════════════════════════
+         ┌───────┐  ┌───────┐  ┌───────┐
+         │ Item1 │  │ Item2 │  │ Item3 │  ← 元素沿主轴排列
+         └───────┘  └───────┘  └───────┘
+                        ↑
+                  交叉轴方向（从上到下）
+```
 
-### 2.2 关键属性速查
-| 属性 | 作用 | 后端类比 |
-| :--- | :--- | :--- |
-| `justify-content` | 主轴对齐（center, space-between） | 负载均衡算法 |
-| `align-items` | 交叉轴对齐（center, stretch） | 垂直对齐规格 |
-| `flex: 1` | 缩写 = `flex-grow: 1; flex-shrink: 1; flex-basis: 0%` | 弹性线程池，抢占空闲 CPU |
-| `flex: none` | 不伸缩，固定宽度 | 独占物理核心 |
+| 属性 | 作用于 | 效果 | 后端类比 |
+| :--- | :--- | :--- | :--- |
+| `justify-content` | **主轴** | 主轴上的对齐和间距分配 | 负载均衡算法（Round-Robin/Weighted） |
+| `align-items` | **交叉轴** | 交叉轴上的对齐（顶部/居中/拉伸） | 垂直对齐规格 |
+| `flex-grow` | **主轴** | 抢剩余空间的比例 | 弹性线程池抢占空闲 CPU |
+| `flex-shrink` | **主轴** | 空间不足时的收缩比例 | 优先级队列中的降级策略 |
+| `flex-basis` | **主轴** | 主轴方向的基准尺寸 | 初始分配配额 |
 
-### 2.3 Flex 中的“溢出陷阱”（重点）
-**情景**：一个 Flex 子项里放了长文本或图片，子项被撑破，超出容器。
-**原因**：Flex 子项默认 `min-width: auto`（即最小宽度不小于内容宽度）。
-**DSH 源码印证**：文档 2.3 明确指出，为了防止溢出，**侧栏和主区强制设置了 `min-width: 0; overflow: hidden;`**。
-**解决方案**：在需要裁剪/滚动的 Flex 子项上，强制覆盖 `min-width: 0`（水平方向）或 `min-height: 0`（垂直方向）。
+### 3.2 `flex: 1` 的完整展开
+
+```css
+flex: 1;  /* 等价于 */
+flex-grow: 1;
+flex-shrink: 1;
+flex-basis: 0%;
+```
+
+- **`flex-grow: 1`**：有剩余空间时，全部抢过来。
+- **`flex-shrink: 1`**：空间不足时，允许收缩。
+- **`flex-basis: 0%`**：从 0 开始计算，完全由 `flex-grow` 决定最终大小。
+
+### 3.3 Flex 子项的 "内容保护锁"（核心陷阱）
+
+**问题**：Flex 子项的 `min-width` 默认值是 `auto`，这意味着**子项不会被压缩到比内容更窄**。
+
+```css
+/* 默认行为（隐含的 min-width: auto） */
+.flex-child {
+    flex: 1;
+    /* 隐含：min-width: auto; 内容多宽，子项至少多宽 */
+}
+
+/* 解除锁定（DSH 铁律） */
+.flex-child {
+    flex: 1;
+    min-width: 0;    /* 允许缩到 0 */
+    overflow: hidden; /* 裁掉溢出的内容 */
+}
+```
+
+**为什么这样设计？**
+浏览器默认 `min-width: auto` 是为了**保护内容的可读性**。如果你把一个包含长单词的按钮压缩到 10px，用户看不清内容。但有时候（比如侧栏折叠），我们确实需要让元素缩得比内容更窄——此时必须显式 `min-width: 0`。
+
+**DSH 源码印证**（文档 2.3）：
+```css
+.sidebarCol, .centerCol, .detailsCol {
+    min-width: 0;
+    overflow: hidden;
+}
+```
 
 ---
 
-## 三、CSS Grid（二维布局模型）—— 真正的“表格/面板”神器
+## 第四部分：Grid（二维布局模型）
 
-Grid 适用于**同时控制行和列**（如整体后台框架、仪表盘）。
+### 4.1 显式网格 vs 隐式网格
 
-### 3.1 核心概念（显式网格与隐式网格）
 - **显式网格**：你用 `grid-template-columns` 和 `grid-template-rows` 定义的轨道。
-- **隐式网格**：Grid 项目超出显式定义行数时，自动生成的额外行（由 `grid-auto-rows` 控制高度）。
-- **单位 `fr`**：**Fraction（剩余空间分数）**。`grid-template-columns: 200px 1fr 2fr` 表示第一列固定 200px，剩下空间分为 3 份，第二列占 1 份，第三列占 2 份。
+- **隐式网格**：Grid 项目超出显式定义行数时，自动生成的额外行（由 `grid-auto-rows` 控制）。
 
-### 3.2 核心函数：`minmax()` 与 `clamp()`
-- `minmax(最小值, 最大值)`：设置轨道的尺寸范围。**DSH 源码中的 `computeColumns` 函数本质就是在 JS 里实现这个逻辑**，但 CSS 原生可以用 `minmax(640px, 1fr)` 保证中间栏至少 640px。
-- `clamp(最小值, 理想值, 最大值)`：响应式字号的利器。
+### 4.2 核心单位：`fr`（Fraction）
 
-### 3.3 DSH 源码中的 Grid 最佳实践（三栏架构）
-文档 2.3 的 `AppFrame.module.css` 揭示了大型应用 Grid 的玩法：
-1. **整体框架**：`display: grid; grid-template-rows: 100%; height: 100%;`。
-2. **列宽动态控制**：将计算好的宽度通过 JS 内联样式写入 `grid-template-columns`（例如 `style={{ gridTemplateColumns: `${sidebar}px ${center}px ${details}px` }}`）。
-3. **拖拽防抖**：拖动时给父级加 `[data-dragging]` 属性，CSS 配合 `transition: none` 关闭过渡动画，防止动画滞后导致鼠标脱节。
+`fr` 是 **"剩余空间的分数"**。
+
+```css
+grid-template-columns: 200px 1fr 2fr;
+/* 
+  第一列固定 200px
+  剩余空间分为 3 份
+  第二列占 1 份，第三列占 2 份
+*/
+```
+
+### 4.3 `minmax()` 函数（设定轨道尺寸范围）
+
+```css
+grid-template-columns: 1fr minmax(640px, 1fr) 1fr;
+/* 中间列最小 640px，且可以弹性扩张 */
+```
+
+### 4.4 Grid 的过渡动画（折叠侧栏的标准做法）
+
+**铁律**：只有 `grid-template-columns` 支持平滑过渡，`display: none` 做不到。
+
+```css
+.app-frame {
+    display: grid;
+    grid-template-columns: 240px 1fr 320px;
+    transition: grid-template-columns 0.25s ease-in-out;
+}
+
+/* 折叠侧栏：列宽从 240px 变为 64px，触发平滑动画 */
+.app-frame.collapsed {
+    grid-template-columns: 64px 1fr 320px;
+}
+```
+
+### 4.5 DSH 的 `computeColumns` 函数逻辑（JS 计算列宽）
+
+当 CSS 的简单 `fr` 无法满足复杂约束时，DSH 用 JS 计算后内联写入 `grid-template-columns`：
+
+```javascript
+export function computeColumns(viewport, sidebar, details) {
+    // 侧栏最小 200px，最大 400px
+    const s = clampWidth(sidebar, SIDEBAR_MIN, SIDEBAR_MAX);
+    // 主区最小 640px（死保对话流可读性）
+    const CENTER_MIN = 640;
+
+    // 先尝试三列等比例分配
+    if (s + details + CENTER_MIN <= viewport) {
+        return { sidebar: s, center: viewport - s - details, details };
+    }
+    // 空间不足：先压缩详情栏
+    const d1 = Math.max(DETAILS_MIN, viewport - s - CENTER_MIN);
+    // 再不行：牺牲详情栏（宽度归零）
+    return { sidebar: s, center: Math.max(0, viewport - s), details: 0 };
+}
+```
 
 ---
 
-## 四、布局避坑指南（结合 DSH 源码的 3 条铁律）
+## 第五部分：CSS 变量与主题系统（Token）
 
-1. **铁律一：滚动条占用空间**
-   - 问题：滚动条出现，页面宽度被挤压，布局抖动。
-   - 解法：全局使用 `scrollbar-gutter: stable;`（文档 2.5），让滚动条位置永远预留，不挤压内容。
+### 5.1 什么是 Token？
 
-2. **铁律二：Grid 动画只认 `grid-template-columns`**
-   - 折叠侧栏不要用 `display: none`（无法做过渡动画）。DSH 的做法是改变 `grid-template-columns` 的值，并配合 `transition`（文档 2.3），这样可以平滑展开/收起。
+Token 是**带语义的 CSS 变量名**，相当于前端的"配置中心"。
 
-3. **铁律三：容器查询（Container Queries）优于媒体查询（Media Queries）**
-   - 组件在不同父级容器下表现不同。DSH 使用 `container-type: inline-size` + `@container`（文档 2.7），让组件根据自身宽度适配，而非根据视口（Viewport）适配，实现了真正的原子化组件。
+### 5.2 DSH 的三层 Token 架构
+
+| 层级 | 命名规则 | 示例 | 后端类比 |
+| :--- | :--- | :--- | :--- |
+| **Static（色板）** | `--dsw-static-<色系>-<亮度>` | `--dsw-static-neutral-bluish-950: rgb(21,21,23);` | 硬件资源（CPU/内存规格） |
+| **Alias（语义）** | `--dsw-alias-<用途>-<状态>` | `--dsw-alias-bg-base: var(--dsw-static-neutral-bluish-00);` | 配置项（`cache.redis.host`） |
+| **Specific（组件专用）** | `--dsw-specific-<组件>-<属性>` | 组件内覆盖别名 | 局部覆盖（`@Qualifier`） |
+
+### 5.3 一键深色模式的原理
+
+```css
+/* 浅色模式（默认） */
+body {
+    --dsw-alias-bg-base: var(--dsw-static-white);
+    --dsw-alias-text-primary: var(--dsw-static-gray-900);
+}
+
+/* 深色模式：只需覆盖变量定义 */
+body[data-ds-dark-theme] {
+    --dsw-alias-bg-base: var(--dsw-static-gray-950);
+    --dsw-alias-text-primary: var(--dsw-static-white);
+}
+```
+所有组件都用 `var(--dsw-alias-bg-base)` 引用背景色，深色模式自动生效，**不需要修改任何组件代码**。
 
 ---
 
-## 五、🎯 完整学习项目源码：手写 DSH 极简三栏后台框架
+## 第六部分：滚动条与溢出治理
 
-为了让你一次性吃透 **Flex + Grid + BFC + 滚动治理**，我写了一份完整的可直接运行的 HTML 文件。它模拟了 DSH 的 `AppFrame`：
+### 6.1 滚动条挤压内容的解决方案
 
-- **Grid 三栏布局**（侧栏 240px，主区自适应，详情栏 320px）。
-- **Flex 嵌套列表**（会话列表使用 Flex 纵向排列，超出滚动）。
-- **主内容区“粘性底部”**（Flex 实现类似后端的 Sticky Footer）。
-- **修复了溢出的 `min-width:0` 陷阱**。
+**问题**：滚动条出现时，视口宽度减少，页面内容重新布局（Reflow），导致布局抖动。
 
-### 源码（保存为 `index.html` 直接运行）
+**DSH 铁律（文档 2.5）**：
+```css
+body {
+    scrollbar-gutter: stable; /* 永远预留滚动条位置 */
+}
+
+.scroll-container {
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
+}
+```
+
+### 6.2 自定义滚动条样式
+
+```css
+/* WebKit 内核（Chrome/Safari/Edge） */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-thumb {
+    background: var(--dsh-scrollbar-thumb);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* Firefox */
+@supports not selector(::-webkit-scrollbar) {
+    body {
+        scrollbar-width: thin;
+        scrollbar-color: var(--dsh-scrollbar-thumb) transparent;
+    }
+}
+```
+
+---
+
+## 第七部分：性能优化必知必会
+
+### 7.1 `transform` vs `left/top`（GPU vs CPU）
+
+| 写法 | 触发阶段 | 硬件 |
+| :--- | :--- | :--- |
+| `left: 100px;` | **Layout → Paint → Composite** | CPU 全重 |
+| `transform: translateX(100px);` | **仅 Composite** | GPU 矩阵乘法 |
+
+**为什么 `transform` 快？**
+- CPU 只在第一帧"画一次图"（Paint），上传到显存。
+- 之后每一帧，GPU 直接对纹理做矩阵变换。
+- 类比：CPU 负责把一张照片扫描进电脑，GPU 负责在屏幕上随意拖拽、旋转它。
+
+### 7.2 `will-change` 的正确用法
+
+```css
+/* ✅ 正确：只在确实需要动画的元素上开启 */
+.animated-menu {
+    will-change: transform, opacity;
+}
+
+/* ❌ 错误：对大量静态元素开启，爆显存 */
+.list-item {
+    will-change: transform; /* 100 个列表项 = 100 个独立合成层 */
+}
+```
+
+### 7.3 rAF（requestAnimationFrame）批处理
+
+**原理**：将一帧内（约 16ms）的多次 DOM 变更合并为 1 次渲染。
+
+```javascript
+function rafBatch() {
+    let scheduled = false;
+    const pending = [];
+
+    return function flush(callback) {
+        pending.push(callback);
+        if (!scheduled) {
+            scheduled = true;
+            requestAnimationFrame(() => {
+                const snapshot = [...pending];
+                pending.length = 0;
+                scheduled = false;
+                snapshot.forEach(fn => fn());
+            });
+        }
+    };
+}
+```
+
+---
+
+## 第八部分：完整可运行源码（综合示例）
+
+这份 HTML 文件包含了上述所有核心概念，并以可视化区块展示，你可以直接保存运行，逐个验证。
 
 ```html
 <!DOCTYPE html>
@@ -103,9 +361,11 @@ Grid 适用于**同时控制行和列**（如整体后台框架、仪表盘）�
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DSH 极简三栏框架 - 后端学前端</title>
+    <title>HTML/CSS 完整指南 - 综合示例</title>
     <style>
-        /* ===== 1. 全局重置 & 滚动条治理（DSH 铁律） ===== */
+        /* ================================================================
+           1. 全局 Reset + box-sizing 铁律
+           ================================================================ */
         *,
         *::before,
         *::after {
@@ -114,20 +374,20 @@ Grid 适用于**同时控制行和列**（如整体后台框架、仪表盘）�
             padding: 0;
         }
 
-        html,
+        /* ================================================================
+           2. 全局滚动条治理（scrollbar-gutter: stable）
+           ================================================================ */
         body {
-            height: 100%;
             font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-            background: #f5f7fa;
+            background: #f0f2f5;
             color: #1a1a1a;
-        }
-
-        /* 模拟 DSH 滚动条稳定策略：永远预留滚动条位置，防止挤压内容 */
-        body {
+            padding: 24px;
             scrollbar-gutter: stable;
         }
 
-        /* 自定义滚动条皮肤（WebKit） */
+        /* ================================================================
+           3. 自定义滚动条（WebKit + Firefox 双路径）
+           ================================================================ */
         ::-webkit-scrollbar {
             width: 6px;
             height: 6px;
@@ -140,425 +400,811 @@ Grid 适用于**同时控制行和列**（如整体后台框架、仪表盘）�
             background: transparent;
         }
 
-        /* ===== 2. 根容器：Grid 三栏架构（模拟 DSH AppFrame） ===== */
-        .app-frame {
-            display: grid;
-            height: 100vh;
-            /* 
-               【核心原理】列宽由 JS 动态计算（模拟 computeColumns）。
-               - 侧栏: 240px 固定
-               - 主区: 1fr 撑满剩余 
-               - 详情: 320px 固定（后期可改为 0 实现折叠）
-               注意：transition 挂载在 grid-template-columns 上实现平滑动画
-            */
-            grid-template-columns: 240px 1fr 320px;
-            grid-template-rows: 100%;
-            transition: grid-template-columns 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-            background: #ffffff;
+        @supports not selector(::-webkit-scrollbar) {
+            body {
+                scrollbar-width: thin;
+                scrollbar-color: #c1c7cd transparent;
+            }
         }
 
-        /* 【防溢出铁律】所有 Grid 列必须是 min-width:0 + overflow:hidden，否则内容会撑破网格 */
-        .app-frame>* {
+        /* ================================================================
+           4. 页面容器
+           ================================================================ */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        /* ================================================================
+           5. 卡片组件（通用）
+           ================================================================ */
+        .card {
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 24px;
+            border: 1px solid #e9ecf0;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+        }
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #1a1a1a;
+        }
+        .card-title .badge {
+            font-size: 12px;
+            font-weight: 400;
+            background: #eef2f6;
+            padding: 2px 12px;
+            border-radius: 20px;
+            color: #4a5a6a;
+        }
+        .card-desc {
+            font-size: 14px;
+            color: #5a6a7a;
+            margin-bottom: 16px;
+            line-height: 1.6;
+        }
+
+        /* ================================================================
+           6. Flex 布局示例：导航栏
+           ================================================================ */
+        .nav-demo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: #2c3e50;
+            padding: 12px 20px;
+            border-radius: 8px;
+            color: white;
+        }
+        .nav-demo .brand {
+            font-weight: 700;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+        .nav-demo .spacer {
+            flex: 1;
+        }
+        .nav-demo .nav-item {
+            padding: 6px 14px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.08);
+            cursor: default;
+            transition: background 0.15s;
+            flex-shrink: 0;
+        }
+        .nav-demo .nav-item:hover {
+            background: rgba(255, 255, 255, 0.18);
+        }
+        .nav-demo .nav-item.active {
+            background: #3498db;
+        }
+
+        /* ================================================================
+           7. Flex 子项 min-width:0 陷阱演示
+           ================================================================ */
+        .flex-trap-demo {
+            display: flex;
+            gap: 12px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 16px;
+            border: 2px dashed #d0d7de;
+            width: 100%;
+        }
+        .flex-trap-demo .item {
+            flex: 1;
+            background: #3498db;
+            color: white;
+            padding: 12px;
+            border-radius: 6px;
+            text-align: center;
+            /* 关键：默认 min-width: auto，长单词会撑破 */
+            /* 解除锁定：放开下面两行注释 */
+            /* min-width: 0; */
+            /* overflow: hidden; */
+        }
+        .flex-trap-demo .item .long-word {
+            /* 模拟超长内容 */
+            display: inline-block;
+            white-space: nowrap;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .flex-trap-demo .item:nth-child(2) {
+            background: #2ecc71;
+        }
+        .flex-trap-demo .item:nth-child(3) {
+            background: #e67e22;
+        }
+
+        /* ================================================================
+           8. Grid 三栏布局（模拟 DSH AppFrame）
+           ================================================================ */
+        .grid-frame {
+            display: grid;
+            grid-template-columns: 200px 1fr 260px;
+            grid-template-rows: 300px;
+            gap: 12px;
+            transition: grid-template-columns 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        /* 【铁律】Grid 所有子项必须 min-width:0 + overflow:hidden */
+        .grid-frame>* {
             min-width: 0;
             overflow: hidden;
         }
 
-        /* ===== 3. 侧栏 (Sidebar) - Flex 纵向 + 滚动 ===== */
-        .sidebar {
+        .grid-sidebar {
             background: #2c3e50;
             color: #ecf0f1;
+            padding: 16px;
             display: flex;
             flex-direction: column;
-            padding: 16px 0;
-            /* 侧栏内部利用 Flex 列，高度 100% 撑满父级 Grid 单元 */
-            height: 100%;
+            gap: 8px;
         }
-
-        .sidebar-brand {
-            padding: 0 20px 20px 20px;
-            font-weight: 700;
-            font-size: 18px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            flex-shrink: 0; /* 头部不压缩 */
-        }
-
-        /* 会话列表：Flex 列 + 溢出滚动（让出滚动条位置） */
-        .session-list {
-            flex: 1; /* 占满剩余高度 */
-            overflow-y: auto;
-            overflow-x: hidden;
-            padding: 12px 0;
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            /* 确保滚动条稳定，不挤压内部元素宽度 */
-            scrollbar-gutter: stable;
-        }
-
-        .session-item {
-            padding: 10px 20px;
-            border-radius: 6px;
-            margin: 0 8px;
-            background: transparent;
-            cursor: pointer;
-            transition: background 0.15s;
-            /* 文本溢出省略号（经典三件套） */
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            flex-shrink: 0; /* 防止被压缩 */
-        }
-        .session-item:hover {
-            background: rgba(255, 255, 255, 0.1);
-        }
-        .session-item.active {
-            background: #3498db;
-            color: white;
-        }
-
-        /* 侧栏底部用户信息：flex-shrink:0 保证始终在底部 */
-        .sidebar-footer {
-            padding: 16px 20px;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-            font-size: 14px;
-            flex-shrink: 0;
-        }
-
-        /* ===== 4. 主区 (Center) - Flex 列 + 粘性底部 ===== */
-        .center {
-            background: #ffffff;
-            display: flex;
-            flex-direction: column;
-            height: 100%;
-            /* 铁律：主区必须有 min-height:0 才能让内部 flex:1 的滚动正常 */
-            min-height: 0;
-            border-right: 1px solid #eaeef2;
-        }
-
-        /* 聊天头部 */
-        .chat-header {
-            padding: 16px 24px;
-            border-bottom: 1px solid #eaeef2;
-            flex-shrink: 0;
+        .grid-sidebar .title {
             font-weight: 600;
-            background: #fafbfc;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 8px;
+        }
+        .grid-sidebar .item {
+            padding: 6px 12px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.05);
+            font-size: 13px;
+            cursor: default;
+        }
+        .grid-sidebar .item.active {
+            background: #3498db;
         }
 
-        /* 消息流核心区 - flex:1 撑满 + 滚动 */
-        .chat-messages {
+        .grid-center {
+            background: #ffffff;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #e9ecf0;
+            border-radius: 8px;
+        }
+        .grid-center .header {
+            font-weight: 600;
+            border-bottom: 1px solid #e9ecf0;
+            padding-bottom: 8px;
+            flex-shrink: 0;
+        }
+        .grid-center .body {
             flex: 1;
             overflow-y: auto;
-            padding: 24px 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-            /* 模拟 DSH 的 scrollbar-gutter:stable */
+            padding: 12px 0;
+            font-size: 14px;
+            color: #3a4a5a;
             scrollbar-gutter: stable;
-            min-height: 0; /* 关键：配合父级 min-height:0 防止溢出 */
+            min-height: 0;
         }
-
-        /* 消息气泡 - Flex 行排列 */
-        .message {
-            display: flex;
-            gap: 12px;
-            max-width: 80%;
+        .grid-center .body .msg {
+            padding: 8px 12px;
+            background: #f1f3f5;
+            border-radius: 6px;
+            margin-bottom: 8px;
         }
-        /* 用户消息靠右，AI 消息靠左 */
-        .message.user {
-            align-self: flex-end;
-            flex-direction: row-reverse;
-        }
-        .message.ai {
-            align-self: flex-start;
-        }
-
-        .message-avatar {
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            flex-shrink: 0;
+        .grid-center .body .msg.self {
             background: #3498db;
+            color: white;
+            text-align: right;
+        }
+        .grid-center .footer {
+            flex-shrink: 0;
+            display: flex;
+            gap: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #e9ecf0;
+        }
+        .grid-center .footer input {
+            flex: 1;
+            padding: 6px 12px;
+            border: 1px solid #d0d7de;
+            border-radius: 6px;
+            outline: none;
+            min-width: 0;
+        }
+        .grid-center .footer input:focus {
+            border-color: #3498db;
+        }
+        .grid-center .footer button {
+            padding: 6px 18px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+
+        .grid-details {
+            background: #f8f9fa;
+            padding: 16px;
+            border: 1px solid #e9ecf0;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #3a4a5a;
+            overflow-y: auto;
+        }
+        .grid-details .label {
+            font-weight: 600;
+            color: #1a1a1a;
+        }
+
+        /* Grid 折叠控制 */
+        .grid-frame.collapsed-details {
+            grid-template-columns: 200px 1fr 0px;
+        }
+        .grid-frame.collapsed-sidebar {
+            grid-template-columns: 56px 1fr 260px;
+        }
+        .grid-frame.collapsed-sidebar .grid-sidebar .title span,
+        .grid-frame.collapsed-sidebar .grid-sidebar .item span {
+            display: none;
+        }
+        .grid-frame.collapsed-sidebar .grid-sidebar .item {
+            text-align: center;
+            padding: 6px 0;
+        }
+
+        /* ================================================================
+           9. transform vs left 性能对比演示
+           ================================================================ */
+        .perf-demo {
+            display: flex;
+            gap: 40px;
+            padding: 16px 0;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .perf-box {
+            width: 120px;
+            height: 80px;
+            border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-size: 14px;
-        }
-        .message.ai .message-avatar {
-            background: #95a5a6;
-        }
-
-        .message-bubble {
-            padding: 12px 16px;
-            border-radius: 12px;
-            background: #f1f3f5;
-            word-break: break-word;
-            line-height: 1.6;
-        }
-        .message.user .message-bubble {
-            background: #3498db;
-            color: white;
-        }
-
-        /* 粘性输入栏（模拟 DSH 的 sticky composer） */
-        .chat-composer {
-            flex-shrink: 0;
-            padding: 16px 24px;
-            border-top: 1px solid #eaeef2;
-            background: #fafbfc;
-            display: flex;
-            gap: 12px;
-            align-items: center;
-        }
-        .chat-composer input {
-            flex: 1;
-            padding: 10px 16px;
-            border: 1px solid #d0d7de;
-            border-radius: 8px;
-            outline: none;
-            font-size: 14px;
-            transition: border 0.2s;
-            min-width: 0; /* 输入框防溢出 */
-        }
-        .chat-composer input:focus {
-            border-color: #3498db;
-        }
-        .chat-composer button {
-            padding: 10px 24px;
-            background: #3498db;
-            color: white;
-            border: none;
-            border-radius: 8px;
             font-weight: 600;
-            cursor: pointer;
+            font-size: 13px;
+            transition: 1s ease-in-out;
             flex-shrink: 0;
-            transition: background 0.15s;
         }
-        .chat-composer button:hover {
-            background: #217dbb;
+        .perf-box.bad {
+            background: #e74c3c;
+            position: relative;
+            left: 0;
         }
-
-        /* ===== 5. 详情栏 (Details) - 展示特定上下文 ===== */
-        .details {
-            background: #fafbfc;
-            padding: 20px 16px;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-            overflow-y: auto;
+        .perf-box.good {
+            background: #2ecc71;
+            transform: translateX(0);
         }
-        .details-card {
-            background: white;
-            border-radius: 12px;
-            padding: 16px;
-            border: 1px solid #eaeef2;
-            font-size: 14px;
+        .perf-box.moved-bad {
+            left: 200px;
         }
-        .details-card h4 {
-            margin-bottom: 8px;
-            color: #2c3e50;
+        .perf-box.moved-good {
+            transform: translateX(200px);
+        }
+        .perf-label {
+            font-size: 13px;
+            color: #5a6a7a;
         }
 
-        /* ===== 6. 响应式：窄屏自动折叠详情栏（模拟 DSH 断点） ===== */
-        @media (max-width: 1024px) {
-            .app-frame {
-                /* 详情栏宽度归零，但保留过渡动画 */
-                grid-template-columns: 240px 1fr 0px;
+        /* ================================================================
+           10. CSS 变量 Token 演示（主题切换）
+           ================================================================ */
+        /* 定义静态色板 */
+        :root {
+            --static-white: #ffffff;
+            --static-gray-100: #f0f2f5;
+            --static-gray-800: #2c3e50;
+            --static-gray-900: #1a1a1a;
+            --static-blue-500: #3498db;
+        }
+
+        /* 语义 Token（浅色主题） */
+        body {
+            --alias-bg-card: var(--static-white);
+            --alias-bg-page: var(--static-gray-100);
+            --alias-text-primary: var(--static-gray-900);
+            --alias-text-secondary: #5a6a7a;
+            --alias-border: #e9ecf0;
+            --alias-brand: var(--static-blue-500);
+        }
+
+        /* 深色主题（通过 data 属性切换） */
+        body[data-theme="dark"] {
+            --alias-bg-card: #1e1e2a;
+            --alias-bg-page: #0d1117;
+            --alias-text-primary: #e6edf3;
+            --alias-text-secondary: #8b949e;
+            --alias-border: #30363d;
+            --alias-brand: #58a6ff;
+        }
+
+        /* 应用 Token */
+        body {
+            background: var(--alias-bg-page);
+            color: var(--alias-text-primary);
+            transition: background 0.3s, color 0.3s;
+        }
+        .card {
+            background: var(--alias-bg-card);
+            border-color: var(--alias-border);
+        }
+        .card-title {
+            color: var(--alias-text-primary);
+        }
+        .card-desc {
+            color: var(--alias-text-secondary);
+        }
+
+        /* ================================================================
+           11. 响应式断点（@media）
+           ================================================================ */
+        @media (max-width: 900px) {
+            .grid-frame {
+                grid-template-columns: 160px 1fr 0px;
             }
-            .details {
-                /* 虽然宽度为 0，但内部内容仍存在，需要隐藏防止横向滚动 */
-                overflow: hidden;
-                padding: 0;
-                border: none;
+            .grid-details {
+                display: none;
             }
         }
-
-        @media (max-width: 720px) {
-            /* 极窄屏折叠侧栏为浮动菜单（这里是纯 CSS 模拟隐藏） */
-            .app-frame {
+        @media (max-width: 600px) {
+            .grid-frame {
                 grid-template-columns: 0px 1fr 0px;
             }
-            .sidebar {
-                overflow: hidden;
-                padding: 0;
-                border: none;
+            .grid-sidebar {
+                display: none;
             }
-            /* 实际生产环境会配合 Portal/Overlay，这里仅演示原理 */
+            .perf-demo {
+                flex-direction: column;
+                gap: 20px;
+            }
+            body {
+                padding: 12px;
+            }
         }
 
-        /* 小彩蛋：点击侧栏折叠触发的过渡（纯 JS 演示） */
-        .app-frame.collapsed {
-            grid-template-columns: 64px 1fr 320px;
+        /* ================================================================
+           12. 工具类
+           ================================================================ */
+        .flex-row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            align-items: center;
         }
-        .app-frame.collapsed .sidebar-brand span {
-            display: none;
+        .mt-2 {
+            margin-top: 12px;
         }
-        .app-frame.collapsed .session-item span {
-            display: none;
+        .text-sm {
+            font-size: 13px;
+            color: var(--alias-text-secondary);
         }
-        .app-frame.collapsed .session-item {
-            text-align: center;
-            padding: 10px 0;
+        .gap-2 {
+            gap: 12px;
         }
-        .app-frame.collapsed .sidebar-footer {
-            text-align: center;
+        .btn {
+            padding: 6px 16px;
+            border: none;
+            border-radius: 6px;
+            background: var(--alias-brand);
+            color: white;
+            cursor: pointer;
+            font-weight: 500;
+            transition: opacity 0.15s;
+        }
+        .btn:hover {
+            opacity: 0.85;
+        }
+        .btn.secondary {
+            background: var(--alias-border);
+            color: var(--alias-text-primary);
         }
     </style>
 </head>
 <body>
+    <div class="container">
 
-    <!-- ========== 应用框架 ========== -->
-    <div class="app-frame" id="appFrame">
-        <!-- 1. 侧栏 -->
-        <aside class="sidebar">
-            <div class="sidebar-brand">📋 <span>DSH 工作区</span></div>
-            <nav class="session-list" id="sessionList">
-                <!-- 动态生成 15 条会话（演示滚动） -->
-            </nav>
-            <div class="sidebar-footer">👤 <span>后端工程师</span></div>
-        </aside>
+        <!-- ============================================================
+        标题区
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">
+                🎨 HTML/CSS 完整指南
+                <span class="badge">综合示例 · 可运行</span>
+            </div>
+            <div class="card-desc">
+                这份示例包含了盒模型、Flex/Grid 布局、CSS 变量 Token、transform 性能优化、
+                滚动治理、响应式断点等全部核心概念。点击下方按钮验证原理。
+            </div>
+            <div class="flex-row">
+                <button class="btn" onclick="toggleTheme()">🌓 切换深色/浅色主题</button>
+                <button class="btn secondary" onclick="toggleDetails()">📋 折叠/展开详情栏</button>
+                <button class="btn secondary" onclick="toggleSidebar()">📂 折叠/展开侧栏</button>
+                <button class="btn secondary" onclick="togglePerf()">🏃 运行性能对比</button>
+                <button class="btn secondary" onclick="toggleFlexTrap()">🔓 切换 Flex 陷阱修复</button>
+            </div>
+        </div>
 
-        <!-- 2. 主区 -->
-        <main class="center">
-            <header class="chat-header">💬 对话流 · 主工作区</header>
-            <div class="chat-messages" id="chatMessages">
-                <!-- 消息由 JS 动态渲染 -->
+        <!-- ============================================================
+        1. 盒模型可视化
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">📦 盒模型（Box Model） <span class="badge">border-box 铁律</span></div>
+            <div class="card-desc">
+                所有元素统一 <code>box-sizing: border-box</code>，宽高 = content + padding + border。
+                下方盒子的总宽度固定为 200px，padding 和 border 向内挤压内容区。
             </div>
-            <div class="chat-composer">
-                <input type="text" placeholder="输入消息，Enter 发送..." id="msgInput" />
-                <button id="sendBtn">发送</button>
-                <!-- 模拟 DSH 铁律：折叠侧栏的演示按钮 -->
-                <button id="toggleSidebar" style="background:#6c7a89;">折叠侧栏</button>
+            <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
+                <div style="background:#3498db;color:white;width:200px;padding:16px;border:4px solid #2c3e50;border-radius:8px;text-align:center;">
+                    总宽 200px<br>
+                    <span style="font-size:12px;">padding:16px + border:4px</span>
+                </div>
+                <div style="font-size:13px;color:var(--alias-text-secondary);">
+                    <code>width: 200px; padding: 16px; border: 4px;</code><br>
+                    内容区宽度 = 200 - 16×2 - 4×2 = <strong>160px</strong>
+                </div>
             </div>
-        </main>
+        </div>
 
-        <!-- 3. 详情栏 -->
-        <aside class="details">
-            <div class="details-card">
-                <h4>📌 当前上下文</h4>
-                <p style="color:#5a6a7a; line-height:1.5;">此处展示选中节点的元数据、工具调用详情或思考链。宽度由 Grid 第三列控制，<br> <strong>min-width:0</strong> 保证内容溢出时隐藏。</p>
+        <!-- ============================================================
+        2. Flex 导航栏 + min-width:0 陷阱
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">🧭 Flex 布局 <span class="badge">主轴 / 交叉轴 / min-width:0</span></div>
+            <div class="card-desc">
+                上方是典型的 Flex 导航栏：<code>justify-content</code> 控制主轴分布，
+                <code>align-items</code> 控制交叉轴居中。下方演示 <strong>min-width:auto 陷阱</strong>。
             </div>
-            <div class="details-card">
-                <h4>🔧 插件信息</h4>
-                <p>ds-depth: v1.2.0</p>
-                <p style="color:#3498db;">slot: sidebar.workspaces</p>
+
+            <!-- Flex 导航栏 -->
+            <div class="nav-demo" style="margin-bottom:16px;">
+                <span class="brand">📋 DSH</span>
+                <span class="spacer"></span>
+                <span class="nav-item active">工作区</span>
+                <span class="nav-item">会话</span>
+                <span class="nav-item">设置</span>
+                <span class="nav-item" style="background:#e74c3c;">退出</span>
             </div>
-        </aside>
+
+            <!-- min-width:0 陷阱 -->
+            <div style="font-size:13px;color:var(--alias-text-secondary);margin-bottom:8px;">
+                <strong>⚠️ Flex 子项默认 <code>min-width: auto</code></strong>：长内容会撑破容器。
+                <span id="flexTrapStatus" style="color:#e74c3c;">❌ 当前：溢出（未修复）</span>
+            </div>
+            <div class="flex-trap-demo" id="flexTrapDemo">
+                <div class="item" id="flexItem1">
+                    <span class="long-word">supercalifragilisticexpialidocious</span>
+                </div>
+                <div class="item">正常文本 B</div>
+                <div class="item">正常文本 C</div>
+            </div>
+            <div style="font-size:12px;color:var(--alias-text-secondary);margin-top:8px;">
+                💡 点击上方 "切换 Flex 陷阱修复" 按钮，观察 <code>min-width:0 + overflow:hidden</code> 的效果。
+            </div>
+        </div>
+
+        <!-- ============================================================
+        3. Grid 三栏布局（DSH 风格）
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">📐 Grid 三栏布局 <span class="badge">DSH AppFrame 风格</span></div>
+            <div class="card-desc">
+                使用 <code>grid-template-columns</code> 控制三栏宽度，<code>transition</code> 实现平滑折叠。
+                所有列强制 <code>min-width:0 + overflow:hidden</code> 防止内容撑破。
+            </div>
+
+            <div class="grid-frame" id="gridFrame">
+                <!-- 侧栏 -->
+                <div class="grid-sidebar">
+                    <div class="title">📂 <span>会话列表</span></div>
+                    <div class="item active"><span>设计系统讨论</span></div>
+                    <div class="item"><span>API 网关重构</span></div>
+                    <div class="item"><span>性能优化方案</span></div>
+                    <div class="item"><span>UI 插槽注册</span></div>
+                    <div class="item"><span>滚动契约实现</span></div>
+                    <div style="flex:1;min-height:0;"></div>
+                    <div class="item" style="background:rgba(255,255,255,0.05);">
+                        <span>👤 后端工程师</span>
+                    </div>
+                </div>
+
+                <!-- 主区 -->
+                <div class="grid-center">
+                    <div class="header">💬 对话流 · 主工作区</div>
+                    <div class="body" id="chatBody">
+                        <div class="msg">你好！我是 DSH 助手。</div>
+                        <div class="msg self">请解释 CSS Grid 的 fr 单位。</div>
+                        <div class="msg"><code>fr</code> 是剩余空间的分数单位。</div>
+                        <div class="msg self">明白了，谢谢！</div>
+                    </div>
+                    <div class="footer">
+                        <input type="text" placeholder="输入消息..." id="chatInput" />
+                        <button onclick="addChatMessage()">发送</button>
+                    </div>
+                </div>
+
+                <!-- 详情栏 -->
+                <div class="grid-details" id="detailsPanel">
+                    <div class="label">📌 当前上下文</div>
+                    <div style="margin-top:8px;line-height:1.6;">
+                        此处展示选中节点的元数据、<br>
+                        工具调用详情或思考链。<br>
+                        <span style="color:var(--alias-brand);">slot: sidebar.workspaces</span>
+                    </div>
+                    <hr style="margin:12px 0;border-color:var(--alias-border);">
+                    <div class="label">🔧 插件信息</div>
+                    <div style="margin-top:4px;font-size:12px;">
+                        ds-depth: v1.2.0<br>
+                        dsh-core: v3.1.0
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================
+        4. transform vs left 性能对比
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">⚡ transform vs left <span class="badge">GPU vs CPU</span></div>
+            <div class="card-desc">
+                <strong style="color:#e74c3c;">红色（改 left）</strong> 触发 Layout → Paint → Composite（CPU 重活）。
+                <strong style="color:#2ecc71;">绿色（改 transform）</strong> 仅触发 Composite（GPU 轻活）。
+                点击下方按钮移动它们，观察流畅度差异。
+            </div>
+            <div class="perf-demo">
+                <div>
+                    <div class="perf-box bad" id="badBox">改 left</div>
+                    <div class="perf-label">❌ CPU 重</div>
+                </div>
+                <div>
+                    <div class="perf-box good" id="goodBox">改 transform</div>
+                    <div class="perf-label">✅ GPU 轻</div>
+                </div>
+            </div>
+            <div class="flex-row">
+                <button class="btn" onclick="movePerfBoxes()">🏃 移动（往返）</button>
+                <button class="btn secondary" onclick="resetPerfBoxes()">↩️ 复位</button>
+                <span class="text-sm" id="perfStatus">就绪</span>
+            </div>
+            <div style="font-size:12px;color:var(--alias-text-secondary);margin-top:8px;">
+                💡 打开 Chrome DevTools → Performance 面板，录制动画过程，
+                观察 <code>Layout</code> 和 <code>Paint</code> 的耗时差异。
+            </div>
+        </div>
+
+        <!-- ============================================================
+        5. CSS 变量 Token 展示
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">🎨 CSS 变量 Token <span class="badge">主题系统</span></div>
+            <div class="card-desc">
+                所有颜色从语义 Token 中取：<code>--alias-bg-card</code>、<code>--alias-text-primary</code> 等。
+                切换主题只需修改 <code>body[data-theme]</code> 上的变量覆盖。
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;">
+                <div style="background:var(--alias-bg-card);border:1px solid var(--alias-border);padding:12px;border-radius:6px;">
+                    <span style="color:var(--alias-text-primary);">主文字</span>
+                </div>
+                <div style="background:var(--alias-bg-card);border:1px solid var(--alias-border);padding:12px;border-radius:6px;">
+                    <span style="color:var(--alias-text-secondary);">次要文字</span>
+                </div>
+                <div style="background:var(--alias-brand);padding:12px;border-radius:6px;color:white;text-align:center;">
+                    品牌色
+                </div>
+                <div style="background:var(--alias-bg-page);padding:12px;border-radius:6px;border:1px solid var(--alias-border);">
+                    页面背景
+                </div>
+            </div>
+            <div style="margin-top:12px;font-size:12px;color:var(--alias-text-secondary);">
+                当前主题：<span id="themeLabel">浅色</span>
+            </div>
+        </div>
+
+        <!-- ============================================================
+        6. 滚动治理 + scrollbar-gutter
+        ============================================================ -->
+        <div class="card">
+            <div class="card-title">📜 滚动治理 <span class="badge">scrollbar-gutter: stable</span></div>
+            <div class="card-desc">
+                下方容器开启 <code>scrollbar-gutter: stable</code>，滚动条永远预留位置，
+                内容宽度不会因滚动条出现/消失而抖动（CLS 优化）。
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                <div style="background:var(--alias-bg-card);border:1px solid var(--alias-border);border-radius:8px;padding:12px;height:120px;overflow-y:auto;scrollbar-gutter:stable;">
+                    <div style="padding:4px 0;">📌 第 1 行</div>
+                    <div style="padding:4px 0;">📌 第 2 行</div>
+                    <div style="padding:4px 0;">📌 第 3 行</div>
+                    <div style="padding:4px 0;">📌 第 4 行</div>
+                    <div style="padding:4px 0;">📌 第 5 行</div>
+                    <div style="padding:4px 0;">📌 第 6 行</div>
+                    <div style="padding:4px 0;">📌 第 7 行</div>
+                    <div style="padding:4px 0;">📌 第 8 行</div>
+                </div>
+                <div style="background:var(--alias-bg-card);border:1px solid var(--alias-border);border-radius:8px;padding:12px;height:120px;overflow-y:auto;scrollbar-gutter:stable;">
+                    <div style="padding:4px 0;">✅ 滚动条出现时</div>
+                    <div style="padding:4px 0;">✅ 内容宽度不变</div>
+                    <div style="padding:4px 0;">✅ 无布局抖动</div>
+                    <div style="padding:4px 0;">📐 这就是 DSH 的</div>
+                    <div style="padding:4px 0;">📐 滚动治理铁律</div>
+                </div>
+            </div>
+        </div>
+
     </div>
 
+    <!-- ============================================================
+    JavaScript 交互脚本
+    ============================================================ -->
     <script>
-        // ========== 数据生成 & DOM 渲染（模拟前端数据层） ==========
+        // ================================================================
+        // 1. 主题切换（Token 演示）
+        // ================================================================
+        let isDark = false;
 
-        // 1. 渲染会话列表（Flex 滚动测试）
-        const sessionList = document.getElementById('sessionList');
-        const sessions = ['设计系统讨论', 'API 网关重构', '性能优化方案', 'UI 插槽注册', '滚动契约实现', 'Markdown 增量解析', 'Worker 线程隔离',
-            'CSS 变量主题', 'Grid 动画调试', 'WebSocket 下行', 'RPC 错误码映射', 'Immer 不可变数据', 'useSyncExternalStore 桥接',
-            'Cordis 插件卸载', 'Vite 构建优化'
-        ];
-        sessions.forEach((name, idx) => {
-            const div = document.createElement('div');
-            div.className = `session-item ${idx === 0 ? 'active' : ''}`;
-            div.innerHTML = `<span>${name}</span>`;
-            div.addEventListener('click', () => {
-                document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
-                div.classList.add('active');
-                // 模拟切换会话，追加系统消息
-                addMessage('system', `切换到会话: ${name}`);
-            });
-            sessionList.appendChild(div);
-        });
-
-        // 2. 渲染聊天消息（粘性底部测试）
-        const messagesContainer = document.getElementById('chatMessages');
-        const initialMessages = [
-            { role: 'ai', content: '你好！我是 DeepSeek 助手。今天我们来学习 CSS Grid 和 Flex 布局。' },
-            { role: 'user', content: '好的，请告诉我怎么防止 Grid 子项溢出？' },
-            { role: 'ai', content: '根据 DSH 源码铁律，请给 Grid 子项加上 `min-width: 0; overflow: hidden;`。' },
-        ];
-
-        function addMessage(role, content) {
-            const wrapper = document.createElement('div');
-            wrapper.className = `message ${role}`;
-
-            const avatar = document.createElement('div');
-            avatar.className = 'message-avatar';
-            avatar.textContent = role === 'user' ? '我' : 'AI';
-
-            const bubble = document.createElement('div');
-            bubble.className = 'message-bubble';
-            bubble.textContent = content;
-
-            wrapper.appendChild(role === 'user' ? bubble : avatar); // 注意顺序模拟 flex-direction
-            wrapper.appendChild(role === 'user' ? avatar : bubble);
-            // 由于 user 有 flex-direction:row-reverse，DOM 顺序不影响视觉排列
-
-            messagesContainer.appendChild(wrapper);
-            // 滚动到底部（模拟 DSH 的跟随逻辑）
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        function toggleTheme() {
+            isDark = !isDark;
+            document.body.setAttribute('data-theme', isDark ? 'dark' : '');
+            document.getElementById('themeLabel').textContent = isDark ? '深色' : '浅色';
         }
 
-        initialMessages.forEach(msg => addMessage(msg.role, msg.content));
+        // ================================================================
+        // 2. Grid 折叠控制
+        // ================================================================
+        function toggleDetails() {
+            const frame = document.getElementById('gridFrame');
+            frame.classList.toggle('collapsed-details');
+        }
 
-        // 3. 发送消息逻辑
-        const input = document.getElementById('msgInput');
-        const sendBtn = document.getElementById('sendBtn');
+        function toggleSidebar() {
+            const frame = document.getElementById('gridFrame');
+            frame.classList.toggle('collapsed-sidebar');
+        }
 
-        function handleSend() {
+        // ================================================================
+        // 3. Flex min-width:0 陷阱切换
+        // ================================================================
+        let flexTrapFixed = false;
+
+        function toggleFlexTrap() {
+            flexTrapFixed = !flexTrapFixed;
+            const items = document.querySelectorAll('.flex-trap-demo .item');
+            const status = document.getElementById('flexTrapStatus');
+
+            if (flexTrapFixed) {
+                items.forEach(el => {
+                    el.style.minWidth = '0';
+                    el.style.overflow = 'hidden';
+                });
+                status.textContent = '✅ 已修复：min-width:0 + overflow:hidden';
+                status.style.color = '#2ecc71';
+            } else {
+                items.forEach(el => {
+                    el.style.minWidth = '';
+                    el.style.overflow = '';
+                });
+                status.textContent = '❌ 当前：溢出（未修复）';
+                status.style.color = '#e74c3c';
+            }
+        }
+
+        // ================================================================
+        // 4. transform vs left 性能对比
+        // ================================================================
+        let perfMoved = false;
+
+        function movePerfBoxes() {
+            const bad = document.getElementById('badBox');
+            const good = document.getElementById('goodBox');
+            perfMoved = !perfMoved;
+
+            if (perfMoved) {
+                // 改 left：触发 Layout → Paint → Composite
+                bad.classList.add('moved-bad');
+                // 改 transform：仅 Composite
+                good.classList.add('moved-good');
+                document.getElementById('perfStatus').textContent = '⏳ 动画进行中...';
+            } else {
+                bad.classList.remove('moved-bad');
+                good.classList.remove('moved-good');
+                document.getElementById('perfStatus').textContent = '↩️ 已复位';
+            }
+            // 1 秒后更新状态
+            setTimeout(() => {
+                if (perfMoved) {
+                    document.getElementById('perfStatus').textContent = '✅ 动画完成（对比流畅度）';
+                }
+            }, 1200);
+        }
+
+        function resetPerfBoxes() {
+            const bad = document.getElementById('badBox');
+            const good = document.getElementById('goodBox');
+            bad.classList.remove('moved-bad');
+            good.classList.remove('moved-good');
+            perfMoved = false;
+            document.getElementById('perfStatus').textContent = '↩️ 已复位';
+        }
+
+        // ================================================================
+        // 5. 聊天消息（Grid 主区交互）
+        // ================================================================
+        function addChatMessage() {
+            const input = document.getElementById('chatInput');
+            const body = document.getElementById('chatBody');
             const text = input.value.trim();
             if (!text) return;
-            addMessage('user', text);
+
+            const msg = document.createElement('div');
+            msg.className = 'msg self';
+            msg.textContent = text;
+            body.appendChild(msg);
             input.value = '';
-            // 模拟 AI 回复（异步）
+
+            // 滚动到底部
+            body.scrollTop = body.scrollHeight;
+
+            // 模拟回复
             setTimeout(() => {
-                const replies = [
-                    '收到！你的消息已存入状态引擎（Zustand）。',
-                    '我正在思考... 请稍后（模拟 LLM 流式输出）。',
-                    '根据 DSH 架构，此消息将通过 WebSocket 下行推送。',
-                    '你可以尝试点击左侧会话列表切换上下文。'
-                ];
-                addMessage('ai', replies[Math.floor(Math.random() * replies.length)]);
+                const reply = document.createElement('div');
+                reply.className = 'msg';
+                reply.textContent = '✅ 已收到：' + text.slice(0, 20) + (text.length > 20 ? '...' : '');
+                body.appendChild(reply);
+                body.scrollTop = body.scrollHeight;
             }, 600);
         }
 
-        sendBtn.addEventListener('click', handleSend);
-        input.addEventListener('keydown', (e) => {
-            // 铁律：中文输入法组合时，回车不发送（模拟 IME 守卫）
+        // Enter 发送（含 IME 守卫）
+        document.getElementById('chatInput').addEventListener('keydown', function(e) {
             if (e.key === 'Enter' && !e.isComposing) {
                 e.preventDefault();
-                handleSend();
+                addChatMessage();
             }
         });
 
-        // 4. 侧栏折叠演示（修改 Grid 列宽，动画由 CSS transition 驱动）
-        const toggleBtn = document.getElementById('toggleSidebar');
-        const appFrame = document.getElementById('appFrame');
-        let collapsed = false;
-
-        toggleBtn.addEventListener('click', () => {
-            collapsed = !collapsed;
-            appFrame.classList.toggle('collapsed', collapsed);
-            toggleBtn.textContent = collapsed ? '展开侧栏' : '折叠侧栏';
-        });
-
-        // 5. 监听窗口缩放，模拟 DSH 的 ResizeObserver 响应
-        // 这里仅仅演示: 当窗口窄于1024px时，框架已通过 @media 折叠详情栏
-        console.log('✅ DSH 极简三栏框架启动成功！');
-        console.log('💡 观测点: Grid过渡动画、Flex滚动粘性、min-width:0防溢出');
+        // ================================================================
+        // 6. 初始化状态
+        // ================================================================
+        console.log('✅ HTML/CSS 完整指南已加载！');
+        console.log('📌 观测点：1. 盒模型 border-box  2. Flex/Grid 布局  3. transform vs left');
+        console.log('📌 4. CSS 变量 Token 主题  5. scrollbar-gutter: stable  6. @media 响应式');
     </script>
 </body>
 </html>
 ```
 
-### 🧪 运行与观测指南（手把手验证原理）
+---
 
-1. **验证 `min-width:0` 铁律**：打开浏览器开发者工具，选中 `.app-frame>*`，去掉 `min-width:0` 或 `overflow:hidden`。你会发现侧栏或主区里的长单词（如 "useSyncExternalStore"）会撑破 Grid 列，导致布局错乱。加回去，立刻恢复——这就是 DSH 源码中反复强调的底线。
+## 第九部分：知识点速查表
 
-2. **验证 Grid 过渡动画**：点击“折叠侧栏”按钮，观察侧栏宽度从 240px 平滑缩到 64px。这是通过 JS 切换 Class，触发 `grid-template-columns` 的 `transition` 实现的。**注意**：`display:none` 做不了这种动画。
-
-3. **验证 Flex 粘性底部**：在消息区狂点“发送”或滚动，观察输入框始终贴在底部。因为 `.center` 是 `flex:column`，`chat-messages` 是 `flex:1`（抢占剩余空间），`chat-composer` 是 `flex-shrink:0`（不压缩）。这对应后端的“弹性伸缩”策略。
-
-4. **验证滚动条不挤布局**：对比去掉 `scrollbar-gutter: stable` 前后的效果，你会发现加上后，滚动条出现时内容宽度不会左右跳动，非常优雅。
+| 主题 | 核心概念 | DSH 源码印证 |
+| :--- | :--- | :--- |
+| **盒模型** | `box-sizing: border-box` 铁律，padding 向内挤压 | 全局 Reset |
+| **Flexbox** | 主轴/交叉轴，`min-width:0` 解除内容保护锁 | `.sidebarCol { min-width:0 }`（文档 2.3） |
+| **Grid** | `grid-template-columns` 过渡动画，`fr` 单位 | `AppFrame.module.css`（文档 2.3） |
+| **CSS 变量** | 三层 Token（Static→Alias→Specific），深色模式 | `design-platform.css`（文档 2.2） |
+| **滚动治理** | `scrollbar-gutter: stable` 防布局抖动 | `scrollbar.css`（文档 2.5） |
+| **性能优化** | `transform` 走 GPU，`will-change` 克制使用 | `ChatView.tsx` useLayoutEffect（文档 1.2） |
+| **响应式** | `@media` 断点，容器查询 | `columns.ts` 自动折叠（文档 2.7） |
+| **GPU 加速** | 合成层（Layer）管理，显存占用控制 | 虚拟化列表（文档 1.6） |
 
 ---
 
-这份文档 + 源码已经涵盖了 **HTML 语义、盒模型、Flex 收缩原理、Grid 二维切割、过渡动画、滚动治理**。把它跑起来，逐行阅读注释，你已经迈出了从前端“门外汉”到“架构师”的坚实一步。下一阶段，我们将进入 `React + TS` 的世界。
+这份指南涵盖了从**盒模型原理**到**GPU 合成机制**的全部知识点。保存为 `.html` 文件运行，你可以亲手验证每一个概念。这就是 DSH 源码背后完整的 CSS 工程化体系。
